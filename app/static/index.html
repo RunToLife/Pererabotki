@@ -7,30 +7,41 @@
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <header class="topbar">
-    <h1>Переработка</h1>
-    <nav id="tabs" class="tabs" role="tablist">
-      <button data-tab="schedule" class="active">График дежурств</button>
-      <button data-tab="official">Официальные часы</button>
-      <button data-tab="unofficial">Неофициальные часы</button>
-      <button data-tab="employees">Дежурные</button>
-      <button data-tab="audit">Аудит</button>
-    </nav>
-    <div id="user" class="user" title="Учётная запись, под которой вы подключились"></div>
-  </header>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">ПР</span>
+        <div><strong>Переработка</strong><small>учёт часов</small></div>
+      </div>
+      <nav id="tabs" class="nav" aria-label="Разделы">
+        <button data-tab="schedule" class="active"><span class="idx">01</span>График дежурств</button>
+        <button data-tab="official"><span class="idx">02</span>Официальные часы</button>
+        <button data-tab="unofficial"><span class="idx">03</span>Неофициальные часы</button>
+        <button data-tab="employees"><span class="idx">04</span>Дежурные</button>
+        <button data-tab="audit"><span class="idx">05</span>Аудит</button>
+      </nav>
+      <div id="user" class="user" title="Учётная запись, под которой вы подключились"></div>
+    </aside>
 
-  <main>
-    <div id="monthbar" class="monthbar">
-      <button id="prev" title="Предыдущий месяц">‹</button>
-      <input type="month" id="month">
-      <button id="next" title="Следующий месяц">›</button>
-      <button id="today">Текущий месяц</button>
-      <select id="history" title="Месяцы, за которые есть данные"></select>
+    <div class="content">
+      <header class="pagehead">
+        <div>
+          <p class="eyebrow" id="eyebrow">Раздел</p>
+          <h1 id="title">График дежурств</h1>
+        </div>
+        <div id="monthbar" class="monthbar">
+          <button id="prev" class="btn sq" title="Предыдущий месяц" aria-label="Предыдущий месяц">‹</button>
+          <input type="month" id="month" aria-label="Месяц">
+          <button id="next" class="btn sq" title="Следующий месяц" aria-label="Следующий месяц">›</button>
+          <button id="today" class="btn">Текущий месяц</button>
+          <select id="history" title="Месяцы, за которые есть данные" aria-label="Месяцы с данными"></select>
+        </div>
+      </header>
+      <section id="view"></section>
     </div>
-    <div id="toast" class="toast" hidden></div>
-    <section id="view"></section>
-  </main>
+  </div>
 
+  <div id="toast" class="toast" role="status" hidden></div>
   <dialog id="dialog"></dialog>
   <script src="/static/app.js"></script>
 </body>

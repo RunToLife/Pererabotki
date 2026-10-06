@@ -2,10 +2,17 @@
 
 const MONTH_NAMES = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август",
   "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"];
-const SOURCE_LABEL = { os: "учётная запись ОС", proxy: "вход через прокси (SSO)",
-  manual: "введено вручную", unknown: "не определено" };
-const ACTION_LABEL = { create: "Создание", update: "Изменение", delete: "Удаление" };
-const HOURS_TITLE = { official: "Официальные часы", unofficial: "Неофициальные часы" };
+const SOURCE = {
+  os: ["учётная запись ОС", "green"], proxy: ["SSO через прокси", "green"],
+  manual: ["введено вручную", "amber"], unknown: ["не определено", "red"],
+};
+const ACTION = { create: ["Создание", "green"], update: ["Изменение", "amber"], delete: ["Удаление", "red"] };
+const TABS = {
+  schedule: ["Раздел 01", "График дежурств"], official: ["Раздел 02", "Официальные часы"],
+  unofficial: ["Раздел 03", "Неофициальные часы"], employees: ["Раздел 04", "Дежурные"],
+  audit: ["Раздел 05", "Журнал аудита"],
+};
+const KIND_BADGE = { official: "green", unofficial: "amber" };
 
 const $ = (sel) => document.querySelector(sel);
 const view = $("#view");
@@ -23,6 +30,13 @@ function shiftMonth(m, delta) {
   const [y, mo] = m.split("-").map(Number);
   const d = new Date(y, mo - 1 + delta, 1);
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
+}
+function plural(n, forms) {
+  const a = Math.abs(n) % 100, b = a % 10;
+  return forms[a > 10 && a < 20 ? 2 : b > 1 && b < 5 ? 1 : b === 1 ? 0 : 2];
+}
+function badge(text, color = "", plain = false) {
+  return `<span class="badge ${color} ${plain ? "plain" : ""}">${esc(text)}</span>`;
 }
 
 async function api(method, url, body) {
@@ -54,8 +68,8 @@ async function guarded(fn) {
 function openForm(title, bodyHtml, onSubmit, submitLabel = "Сохранить") {
   const dlg = $("#dialog");
   dlg.innerHTML = `<h3>${esc(title)}</h3><form method="dialog">${bodyHtml}
-    <div class="actions"><button type="button" value="cancel" id="dlg-cancel">Отмена</button>
-    <button type="submit" class="primary">${esc(submitLabel)}</button></div></form>`;
+    <div class="actions"><button type="button" class="btn" id="dlg-cancel">Отмена</button>
+    <button type="submit" class="btn approve">${esc(submitLabel)}</button></div></form>`;
   const form = dlg.querySelector("form");
   dlg.querySelector("#dlg-cancel").onclick = () => dlg.close();
   form.onsubmit = async (e) => {
@@ -68,20 +82,33 @@ function openForm(title, bodyHtml, onSubmit, submitLabel = "Сохранить")
   if (first) first.focus();
 }
 
-function employeeOptions(selectedId) {
-  return state.employees.map((e) =>
+/** Варианты выбора сотрудника. `current` — сотрудник редактируемой записи: если он удалён из списка,
+ *  его всё равно нужно показать, иначе форма молча подставит другого человека. */
+function employeeOptions(selectedId, current) {
+  const list = [...state.employees];
+  if (current && !list.some((e) => e.id === current.employee_id)) {
+    list.unshift({ id: current.employee_id, full_name: current.full_name, position: `${current.position} (удалён)` });
+  }
+  return list.map((e) =>
     `<option value="${e.id}" ${e.id === selectedId ? "selected" : ""}>${esc(e.full_name)} — ${esc(e.position)}</option>`).join("");
+}
+
+/** Карточка: заголовок, необязательный бейдж справа, тело. */
+function card(title, body, { right = "", flush = false } = {}) {
+  return `<div class="card"><div class="card-head"><h2>${esc(title)}</h2>${right}</div>
+    <div class="card-body ${flush ? "flush" : ""}">${body}</div></div>`;
 }
 
 // ---------- Пользователь ----------
 async function loadUser() {
   const me = await api("GET", "/api/me");
-  $("#user").innerHTML = `Вы: <b>${esc(me.user)}</b> · ${SOURCE_LABEL[me.source] || ""}`;
+  const [label, color] = SOURCE[me.source] || ["", ""];
+  $("#user").innerHTML = `<span class="label">Вы вошли как</span><b>${esc(me.user)}</b>${badge(label, color)}`;
   if (me.source === "unknown") {
     openForm("Как вас зовут?",
       `<p class="muted">Не удалось автоматически определить вашу учётную запись ОС.
        Укажите имя — оно будет записываться в аудит.</p>
-       <label>Имя или логин<input name="name" required maxlength="100"></label>`,
+       <label><span>Имя или логин</span><input name="name" required maxlength="100"></label>`,
       async (d) => { await api("POST", "/api/me", { name: d.name }); await loadUser(); }, "Продолжить");
   }
 }
@@ -104,9 +131,9 @@ async function renderSchedule() {
     const chips = (byDay[date] || []).map((x) =>
       `<div class="chip" title="${esc(x.full_name)} — ${esc(x.position)}${x.note ? "\n" + esc(x.note) : ""}">
          <span>${esc(x.full_name)}${x.note ? " · " + esc(x.note) : ""}</span>
-         <button data-del-duty="${x.id}" title="Снять с дежурства">×</button></div>`).join("");
-    cells += `<div class="${cls}"><div class="dnum"><span>${d}</span>
-      <button class="add" data-add-duty="${date}" title="Назначить дежурного">+</button></div>${chips}</div>`;
+         <button data-del-duty="${x.id}" title="Снять с дежурства" aria-label="Снять с дежурства">×</button></div>`).join("");
+    cells += `<div class="${cls}"><div class="dnum"><span>${pad(d)}</span>
+      <button class="add" data-add-duty="${date}" title="Назначить дежурного" aria-label="Назначить дежурного на ${date}">+</button></div>${chips}</div>`;
   }
 
   const counts = {};
@@ -114,21 +141,22 @@ async function renderSchedule() {
     counts[d.employee_id] = counts[d.employee_id] || { name: d.full_name, position: d.position, n: 0 };
     counts[d.employee_id].n++;
   });
-  const countRows = Object.values(counts).sort((a, b) => a.name.localeCompare(b.name, "ru"))
-    .map((c) => `<tr><td>${esc(c.name)}</td><td>${esc(c.position)}</td><td class="num">${c.n}</td></tr>`).join("");
+  const rank = Object.values(counts).sort((a, b) => b.n - a.n || a.name.localeCompare(b.name, "ru"))
+    .map((c) => `<li><div class="who"><b>${esc(c.name)}</b><small>${esc(c.position)}</small></div>
+      <div class="nums"><span><em>дежурств</em><b>${c.n}</b></span></div></li>`).join("");
 
-  view.innerHTML = `<div class="card"><h2>График дежурств — ${esc(monthTitle(state.month))}</h2>
-    <div class="calendar">${cells}</div></div>
-    <div class="card"><h2>Количество дежурств за месяц</h2>
-    ${countRows ? `<div class="table-wrap"><table><thead><tr><th>ФИО</th><th>Должность</th><th class="num">Дежурств</th></tr></thead>
-      <tbody>${countRows}</tbody></table></div>` : '<p class="muted">В этом месяце дежурств нет.</p>'}</div>`;
+  view.innerHTML = `<div class="split">
+    ${card(monthTitle(state.month), `<div class="calendar">${cells}</div>`,
+      { right: badge(`${duties.length} ${plural(duties.length, ["дежурство", "дежурства", "дежурств"])}`, duties.length ? "green" : "") })}
+    <aside class="rail">${card("По сотрудникам", rank ? `<ul class="kv">${rank}</ul>` : '<div class="empty">В этом месяце дежурств нет.</div>', { flush: true })}</aside>
+  </div>`;
 
   view.querySelectorAll("[data-add-duty]").forEach((btn) => (btn.onclick = () => {
     if (!state.employees.length) return toast("Сначала добавьте дежурных на вкладке «Дежурные»");
     const date = btn.dataset.addDuty;
     openForm(`Дежурство ${date}`,
-      `<label>Дежурный<select name="employee_id">${employeeOptions()}</select></label>
-       <label>Примечание (необязательно)<input name="note" maxlength="300" placeholder="например, ночная смена"></label>`,
+      `<label><span>Дежурный</span><select name="employee_id">${employeeOptions()}</select></label>
+       <label><span>Примечание (необязательно)</span><input name="note" maxlength="300" placeholder="например, ночная смена"></label>`,
       async (d) => { await api("POST", "/api/duties", { date, employee_id: Number(d.employee_id), note: d.note }); await render(); },
       "Назначить");
   }));
@@ -137,39 +165,69 @@ async function renderSchedule() {
 }
 
 // ---------- Часы ----------
-function hoursForm(row) {
+function hoursFields(row) {
   const date = row ? row.work_date : (state.month === currentMonth() ? todayStr() : `${state.month}-01`);
-  return `<label>Дата<input type="date" name="date" value="${date}" required></label>
-    <label>Сотрудник<select name="employee_id">${employeeOptions(row && row.employee_id)}</select></label>
-    <label>Часы<input type="number" name="hours" min="0.25" max="24" step="0.25" value="${row ? row.hours : ""}" required></label>
-    <label>Комментарий<input name="comment" maxlength="500" value="${esc(row ? row.comment : "")}"></label>`;
+  return `<label><span>Дата</span><input type="date" name="date" value="${date}" required></label>
+    <label><span>Сотрудник</span><select name="employee_id">${employeeOptions(row && row.employee_id, row)}</select></label>
+    <label><span>Часы</span><input type="number" name="hours" min="0.25" max="24" step="0.25" value="${row ? row.hours : ""}" required></label>
+    <label><span>Комментарий</span><input name="comment" maxlength="500" value="${esc(row ? row.comment : "")}"></label>`;
+}
+
+/** Живые проверки формы: статус, текст. Сервер всё равно проверяет данные сам. */
+function hoursChecks(form, duties) {
+  const v = Object.fromEntries(new FormData(form));
+  const hrs = parseFloat(v.hours);
+  const items = [];
+  items.push(!v.hours ? ["idle", "Часы: от 0,25 до 24"]
+    : hrs >= 0.25 && hrs <= 24 ? ["ok", "Часы в допустимом диапазоне"] : ["bad", "Часы вне диапазона 0,25–24"]);
+  items.push(v.employee_id ? ["ok", "Сотрудник выбран"] : ["bad", "Выберите сотрудника"]);
+  const inMonth = v.date && v.date.slice(0, 7) === state.month;
+  items.push(!v.date ? ["bad", "Укажите дату"]
+    : inMonth ? ["ok", "Дата в выбранном месяце"] : ["warn", "Дата вне выбранного месяца — запись попадёт в другой месяц"]);
+  if (inMonth && v.employee_id) {
+    const onDuty = duties.some((d) => d.duty_date === v.date && String(d.employee_id) === String(v.employee_id));
+    items.push(onDuty ? ["ok", "По графику сотрудник дежурит в этот день"] : ["warn", "По графику сотрудник в этот день не дежурит"]);
+  }
+  const icon = { ok: "✓", warn: "!", bad: "✕", idle: "•" };
+  return items.map(([s, t]) => `<li class="${s}"><i>${icon[s]}</i><span>${esc(t)}</span></li>`).join("");
 }
 
 async function renderHours(kind) {
-  const [rows, summary] = await Promise.all([
+  const [rows, summary, duties] = await Promise.all([
     api("GET", `/api/hours/${kind}?month=${state.month}`),
     api("GET", `/api/hours/summary?month=${state.month}`),
+    api("GET", `/api/duties?month=${state.month}`),
   ]);
   const total = rows.reduce((s, r) => s + r.hours, 0);
-  const body = rows.map((r) => `<tr><td>${esc(r.work_date)}</td><td>${esc(r.full_name)}<br><span class="muted">${esc(r.position)}</span></td>
-    <td class="num">${fmtNum(r.hours)}</td><td>${esc(r.comment)}</td><td class="muted">${esc(r.created_by)}</td>
-    <td><button class="link" data-edit="${r.id}">Изменить</button><button class="link danger" data-del="${r.id}">Удалить</button></td></tr>`).join("");
-  const sumRows = summary.map((s) => `<tr><td>${esc(s.full_name)}</td><td>${esc(s.position)}</td>
-    <td class="num">${fmtNum(s.official)}</td><td class="num">${fmtNum(s.unofficial)}</td><td class="num"><b>${fmtNum(s.total)}</b></td></tr>`).join("");
+  const body = rows.map((r) => `<tr><td class="mono">${esc(r.work_date)}</td>
+    <td>${esc(r.full_name)}<span class="sub">${esc(r.position)}</span></td>
+    <td class="num">${fmtNum(r.hours)}</td><td>${esc(r.comment)}</td><td class="mono muted">${esc(r.created_by)}</td>
+    <td class="actions"><button class="btn sm warn" data-edit="${r.id}">Изменить</button><button class="btn sm danger" data-del="${r.id}">Удалить</button></td></tr>`).join("");
+  const sumRows = summary.map((s) => `<li><div class="who"><b>${esc(s.full_name)}</b><small>${esc(s.position)}</small></div>
+    <div class="nums"><span><em>офиц.</em><b>${fmtNum(s.official)}</b></span><span><em>неофиц.</em><b>${fmtNum(s.unofficial)}</b></span>
+    <span><em>всего</em><b>${fmtNum(s.total)}</b></span></div></li>`).join("");
 
-  view.innerHTML = `<div class="card"><h2>${HOURS_TITLE[kind]} — ${esc(monthTitle(state.month))}</h2>
-    <form id="addform" class="formrow">${hoursForm()}<button class="primary" type="submit">Добавить</button></form></div>
-    <div class="card"><div class="table-wrap"><table>
-      <thead><tr><th>Дата</th><th>Сотрудник</th><th class="num">Часы</th><th>Комментарий</th><th>Внёс</th><th></th></tr></thead>
-      <tbody>${body || '<tr><td colspan="6" class="muted">Записей за этот месяц нет.</td></tr>'}</tbody>
-      <tfoot><tr><td colspan="2">Итого за месяц</td><td class="num">${fmtNum(total)}</td><td colspan="3"></td></tr></tfoot></table></div></div>
-    <div class="card"><h2>Сводка по сотрудникам</h2>
-    ${sumRows ? `<div class="table-wrap"><table><thead><tr><th>ФИО</th><th>Должность</th><th class="num">Официальные</th>
-      <th class="num">Неофициальные</th><th class="num">Всего</th></tr></thead><tbody>${sumRows}</tbody></table></div>`
-      : '<p class="muted">Нет данных за месяц.</p>'}</div>`;
+  const table = rows.length
+    ? `<div class="table-wrap"><table><thead><tr><th>Дата</th><th>Сотрудник</th><th class="num">Часы</th><th>Комментарий</th><th>Внёс</th><th></th></tr></thead>
+       <tbody>${body}</tbody><tfoot><tr><td colspan="2">Итого за месяц</td><td class="num">${fmtNum(total)}</td><td colspan="3"></td></tr></tfoot></table></div>`
+    : '<div class="empty">Записей за этот месяц нет.</div>';
+
+  view.innerHTML = `<div class="split">
+    ${card(`${TABS[kind][1]} · ${monthTitle(state.month)}`, table,
+      { flush: true, right: badge(`${fmtNum(total)} ч`, KIND_BADGE[kind]) })}
+    <aside class="rail">
+      ${card("Новая запись", `<form id="addform" class="stack">${hoursFields()}
+        <ul id="checks" class="checks" aria-live="polite"></ul>
+        <button class="btn approve block" type="submit">Добавить</button></form>
+        ${state.employees.length ? "" : '<p class="muted">Сначала добавьте дежурных на вкладке «Дежурные».</p>'}`)}
+      ${card("Сводка по сотрудникам", sumRows ? `<ul class="kv">${sumRows}</ul>` : '<div class="empty">Нет данных за месяц.</div>', { flush: true })}
+    </aside></div>`;
 
   const form = $("#addform");
-  if (!state.employees.length) form.insertAdjacentHTML("afterend", '<p class="muted">Сначала добавьте дежурных на вкладке «Дежурные».</p>');
+  const refreshChecks = () => ($("#checks").innerHTML = hoursChecks(form, duties));
+  form.addEventListener("input", refreshChecks);
+  form.addEventListener("change", refreshChecks);
+  refreshChecks();
   form.onsubmit = (e) => {
     e.preventDefault();
     const d = Object.fromEntries(new FormData(form));
@@ -181,7 +239,7 @@ async function renderHours(kind) {
   };
   view.querySelectorAll("[data-edit]").forEach((btn) => (btn.onclick = () => {
     const row = rows.find((r) => r.id === Number(btn.dataset.edit));
-    openForm("Изменить запись", hoursForm(row),
+    openForm("Изменить запись", hoursFields(row),
       async (d) => {
         await api("PUT", `/api/hours/${kind}/${row.id}`, { date: d.date, employee_id: Number(d.employee_id), hours: Number(d.hours), comment: d.comment });
         await render();
@@ -194,21 +252,21 @@ async function renderHours(kind) {
 }
 
 // ---------- Дежурные ----------
-function employeeForm(e) {
-  return `<label>ФИО<input name="full_name" required maxlength="200" value="${esc(e ? e.full_name : "")}"></label>
-    <label>Должность<input name="position" required maxlength="200" value="${esc(e ? e.position : "")}"></label>`;
+function employeeFields(e) {
+  return `<label><span>ФИО</span><input name="full_name" required maxlength="200" value="${esc(e ? e.full_name : "")}"></label>
+    <label><span>Должность</span><input name="position" required maxlength="200" value="${esc(e ? e.position : "")}"></label>`;
 }
 
 async function renderEmployees() {
   const rows = state.employees.map((e) => `<tr><td>${esc(e.full_name)}</td><td>${esc(e.position)}</td>
-    <td><button class="link" data-edit="${e.id}">Изменить</button><button class="link danger" data-del="${e.id}">Удалить</button></td></tr>`).join("");
-  view.innerHTML = `<div class="card"><h2>Добавить дежурного</h2>
-    <form id="addform" class="formrow"><label class="grow">ФИО<input name="full_name" required maxlength="200"></label>
-    <label class="grow">Должность<input name="position" required maxlength="200"></label>
-    <button class="primary" type="submit">Добавить</button></form></div>
-    <div class="card"><h2>Список дежурных (${state.employees.length})</h2><div class="table-wrap"><table>
-    <thead><tr><th>ФИО</th><th>Должность</th><th></th></tr></thead>
-    <tbody>${rows || '<tr><td colspan="3" class="muted">Список пуст. Добавьте первого дежурного.</td></tr>'}</tbody></table></div></div>`;
+    <td class="actions"><button class="btn sm warn" data-edit="${e.id}">Изменить</button><button class="btn sm danger" data-del="${e.id}">Удалить</button></td></tr>`).join("");
+  const table = rows
+    ? `<div class="table-wrap"><table><thead><tr><th>ФИО</th><th>Должность</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`
+    : '<div class="empty">Список пуст. Добавьте первого дежурного.</div>';
+  view.innerHTML = `<div class="split">
+    ${card("Список дежурных", table, { flush: true, right: badge(String(state.employees.length), "", true) })}
+    <aside class="rail">${card("Добавить дежурного", `<form id="addform" class="stack">${employeeFields()}
+      <button class="btn approve block" type="submit">Добавить</button></form>`)}</aside></div>`;
 
   const form = $("#addform");
   form.onsubmit = (e) => {
@@ -218,7 +276,7 @@ async function renderEmployees() {
   };
   view.querySelectorAll("[data-edit]").forEach((btn) => (btn.onclick = () => {
     const emp = state.employees.find((x) => x.id === Number(btn.dataset.edit));
-    openForm("Изменить дежурного", employeeForm(emp), async (d) => { await api("PUT", `/api/employees/${emp.id}`, d); await render(); });
+    openForm("Изменить дежурного", employeeFields(emp), async (d) => { await api("PUT", `/api/employees/${emp.id}`, d); await render(); });
   }));
   view.querySelectorAll("[data-del]").forEach((btn) => (btn.onclick = () => {
     const emp = state.employees.find((x) => x.id === Number(btn.dataset.del));
@@ -244,9 +302,10 @@ function auditDiff(item) {
 }
 
 function auditRow(i) {
-  return `<tr><td>${esc(i.ts)}</td><td>${esc(i.actor)}<br><span class="muted">${esc(i.ip)}</span></td>
-    <td><span class="tag ${esc(i.action)}">${esc(ACTION_LABEL[i.action] || i.action)}</span></td>
-    <td>${esc(i.entity_label)}</td><td>${esc(i.summary)}<div class="audit-diff muted">${auditDiff(i)}</div></td></tr>`;
+  const [label, color] = ACTION[i.action] || [i.action, ""];
+  return `<tr><td class="mono">${esc(i.ts)}</td><td class="mono">${esc(i.actor)}<span class="sub">${esc(i.ip)}</span></td>
+    <td>${badge(label, color)}</td><td>${esc(i.entity_label)}</td>
+    <td>${esc(i.summary)}<div class="audit-diff">${auditDiff(i)}</div></td></tr>`;
 }
 
 async function loadAudit(append) {
@@ -264,18 +323,19 @@ async function loadAudit(append) {
 }
 
 async function renderAudit() {
-  view.innerHTML = `<div class="card"><h2>Журнал аудита</h2>
-    <form id="auditform" class="formrow">
-      <label>Раздел<select name="entity"><option value="">Все</option>
+  view.innerHTML = `<div class="split single">
+    ${card("Фильтры", `<form id="auditform" class="filters">
+      <label><span>Раздел</span><select name="entity"><option value="">Все</option>
         <option value="employee">Список дежурных</option><option value="duty">График дежурств</option>
         <option value="hours_official">Официальные часы</option><option value="hours_unofficial">Неофициальные часы</option></select></label>
-      <label>Кто изменил<input name="actor" value="${esc(auditFilters.actor)}"></label>
-      <label class="grow">Поиск по описанию<input name="q" value="${esc(auditFilters.q)}"></label>
-      <button class="primary" type="submit">Применить</button></form></div>
+      <label><span>Кто изменил</span><input name="actor" value="${esc(auditFilters.actor)}"></label>
+      <label class="grow"><span>Поиск по описанию</span><input name="q" value="${esc(auditFilters.q)}"></label>
+      <button class="btn approve" type="submit">Применить</button></form>`)}
     <div class="card"><div class="table-wrap"><table>
       <thead><tr><th>Когда</th><th>Кто</th><th>Действие</th><th>Где</th><th>Что и на что изменено</th></tr></thead>
       <tbody id="audit-body"></tbody></table></div>
-      <p><span id="audit-count" class="muted"></span> <button id="audit-more" hidden>Показать ещё</button></p></div>`;
+      <div class="pager"><span id="audit-count"></span><button id="audit-more" class="btn sm" hidden>Показать ещё</button></div></div>
+  </div>`;
   const form = $("#auditform");
   form.elements.entity.value = auditFilters.entity;
   form.onsubmit = (e) => {
@@ -299,6 +359,8 @@ async function render() {
   const usesMonth = ["schedule", "official", "unofficial"].includes(state.tab);
   $("#monthbar").hidden = !usesMonth;
   $("#month").value = state.month;
+  $("#eyebrow").textContent = TABS[state.tab][0];
+  $("#title").textContent = TABS[state.tab][1];
   document.querySelectorAll("#tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === state.tab));
   await guarded(async () => {
     state.employees = await api("GET", "/api/employees");
@@ -312,7 +374,10 @@ async function render() {
 
 function setMonth(m) { if (/^\d{4}-\d{2}$/.test(m)) { state.month = m; render(); } }
 
-$("#tabs").onclick = (e) => { const t = e.target.dataset.tab; if (t) { state.tab = t; render(); } };
+$("#tabs").onclick = (e) => {
+  const btn = e.target.closest("[data-tab]");
+  if (btn) { state.tab = btn.dataset.tab; render(); }
+};
 $("#prev").onclick = () => setMonth(shiftMonth(state.month, -1));
 $("#next").onclick = () => setMonth(shiftMonth(state.month, 1));
 $("#today").onclick = () => setMonth(currentMonth());
