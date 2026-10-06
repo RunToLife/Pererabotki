@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Остаток контекста</title>
+<style>
+  :root {
+    --bg: #ffffff; --card: #f6f7f9; --text: #1b1f24; --muted: #667085;
+    --track: #e4e7ec; --ok: #1a9e5c; --warn: #e0a100; --crit: #d92d20;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171c; --card: #1d2229; --text: #e8ebef; --muted: #98a2b3; --track: #2d343d; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+         font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .widget { max-width: 420px; margin: 0 auto; background: var(--card); border-radius: 14px; padding: 18px; }
+  h1 { font-size: 15px; font-weight: 600; margin: 0 0 14px; color: var(--muted); }
+  .big { font-size: 34px; font-weight: 700; letter-spacing: -.5px; }
+  .big small { font-size: 14px; font-weight: 400; color: var(--muted); margin-left: 6px; }
+  .bar { height: 14px; background: var(--track); border-radius: 7px; overflow: hidden; margin: 12px 0 8px; }
+  .fill { height: 100%; width: 0; border-radius: 7px; background: var(--ok); transition: width .5s, background .3s; }
+  .row { display: flex; justify-content: space-between; color: var(--muted); font-size: 13px; }
+  .status { margin-top: 12px; font-size: 13px; font-weight: 600; }
+  details { margin-top: 14px; font-size: 13px; color: var(--muted); }
+  summary { cursor: pointer; }
+  label { display: block; margin-top: 8px; }
+  input { width: 100%; margin-top: 3px; padding: 7px 9px; border-radius: 8px; border: 1px solid var(--track);
+          background: var(--bg); color: var(--text); font: inherit; }
+  button { margin-top: 10px; padding: 7px 14px; border: 0; border-radius: 8px; background: var(--ok);
+           color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+  .note { margin-top: 12px; font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="widget" role="region" aria-label="Остаток контекста">
+  <h1>Сколько контекста ещё доступно</h1>
+  <div class="big"><span id="left">—</span><small>токенов осталось</small></div>
+  <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" id="bar">
+    <div class="fill" id="fill"></div>
+  </div>
+  <div class="row"><span id="used">использовано: —</span><span id="pct">—</span></div>
+  <div class="status" id="status"></div>
+
+  <details>
+    <summary>Обновить значения вручную</summary>
+    <label>Всего (лимит)
+      <input id="inTotal" type="number" min="1" inputmode="numeric">
+    </label>
+    <label>Осталось
+      <input id="inLeft" type="number" min="0" inputmode="numeric">
+    </label>
+    <button id="apply" type="button">Применить</button>
+  </details>
+
+  <div class="note" id="note"></div>
+</div>
+
+<script>
+(function () {
+  var KEY = 'contextMeter.v1';
+  var DEFAULTS = { total: 15000000, left: 14883078, updated: '2026-10-06' };
+
+  function fmt(n) { return Number(n).toLocaleString('ru-RU'); }
+
+  function render(s) {
+    var total = Math.max(1, Number(s.total) || 1);
+    var left = Math.min(total, Math.max(0, Number(s.left) || 0));
+    var leftPct = left / total * 100;
+    var fill = document.getElementById('fill');
+    fill.style.width = leftPct.toFixed(1) + '%';
+    fill.style.background = leftPct > 30 ? 'var(--ok)' : leftPct > 10 ? 'var(--warn)' : 'var(--crit)';
+    document.getElementById('left').textContent = fmt(left);
+    document.getElementById('used').textContent = 'использовано: ' + fmt(total - left) + ' из ' + fmt(total);
+    document.getElementById('pct').textContent = 'свободно ' + leftPct.toFixed(1) + '%';
+    document.getElementById('bar').setAttribute('aria-valuenow', leftPct.toFixed(0));
+    document.getElementById('status').textContent =
+      leftPct > 30 ? 'Запас в порядке' : leftPct > 10 ? 'Запас заканчивается' : 'Почти исчерпан — лучше начать новый чат';
+    document.getElementById('note').textContent =
+      'Данные на ' + (s.updated || '—') + '. Виджет не читает счётчик Claude сам: значения берутся из context-status.json или вводятся вручную.';
+    document.getElementById('inTotal').value = total;
+    document.getElementById('inLeft').value = left;
+  }
+
+  function load() {
+    try { var raw = localStorage.getItem(KEY); if (raw) return JSON.parse(raw); } catch (e) {}
+    return null;
+  }
+
+  function save(s) { try { localStorage.setItem(KEY, JSON.stringify(s)); } catch (e) {} }
+
+  var manual = load();
+  if (manual) { render(manual); }
+  else {
+    render(DEFAULTS);
+    fetch('context-status.json', { cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(); })
+      .then(function (s) { render(s); })
+      .catch(function () {});
+  }
+
+  document.getElementById('apply').addEventListener('click', function () {
+    var s = {
+      total: Number(document.getElementById('inTotal').value),
+      left: Number(document.getElementById('inLeft').value),
+      updated: new Date().toISOString().slice(0, 10)
+    };
+    save(s); render(s);
+  });
+})();
+</script>
+</body>
+</html>
