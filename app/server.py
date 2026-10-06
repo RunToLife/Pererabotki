@@ -5,9 +5,18 @@ Flask + SQLite. Запуск: python app/server.py
   PERER_HOST         адрес прослушивания (по умолчанию 127.0.0.1)
   PERER_PORT         порт (по умолчанию 8080)
   PERER_DATA_DIR     папка с базой и логом (по умолчанию ./data рядом с проектом)
-  PERER_TRUST_PROXY  1 — доверять заголовку X-Remote-User от обратного прокси (SSO)
+  PERER_AUTH         как определять пользователя (подробно — README.md, «Определение пользователя»):
+                       auto    (по умолчанию) Windows: вход по учетке Windows/AD для сетевых
+                               клиентов, на самом сервере — учетка, под которой запущен сервис
+                       windows все, включая localhost, входят только по учетке Windows/AD
+                       proxy   имя берется из заголовка X-Remote-User от обратного прокси (SSO)
+                       off     только учетка сервиса для localhost и ручной ввод
+  PERER_ALLOW_MANUAL 1/0 — разрешить ввод имени вручную (по умолчанию 1, в режиме windows — 0)
+  PERER_KERBEROS     1 — предлагать браузеру Kerberos (Negotiate), нужен SPN HTTP/<сервер>;
+                     по умолчанию 0 — только NTLM, работает без настройки домена
+  PERER_TRUST_PROXY  1 — то же, что PERER_AUTH=proxy (оставлено для совместимости)
 """
-import getpass
+import base64
 import json
 import logging
 import os
@@ -18,7 +27,12 @@ from datetime import date, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from flask import Flask, Response, g, jsonify, request, send_from_directory
+from flask import Flask, Response, g, jsonify, request, send_from_directory, session
+
+try:
+    from . import winauth
+except ImportError:  # запуск как скрипт: python app/server.py
+    import winauth
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -112,7 +126,31 @@ def fmt_hours(value):
     return f"{value:g}"
 
 
-def create_app(db_path=None):
+def load_secret_key(data_dir):
+    """Ключ подписи cookie сессии; создается один раз и хранится в папке данных."""
+    path = Path(data_dir) / "secret.key"
+    try:
+        key = path.read_bytes()
+        if len(key) >= 32:
+            return key
+    except OSError:
+        pass
+    key = os.urandom(32)
+    path.write_bytes(key)
+    return key
+
+
+def resolve_auth_mode():
+    mode = (os.environ.get("PERER_AUTH") or "auto").strip().lower()
+    if os.environ.get("PERER_TRUST_PROXY") == "1":
+        mode = "proxy"
+    if mode not in ("auto", "windows", "proxy", "off"):
+        logging.warning("Неизвестный PERER_AUTH=%s, использую auto", mode)
+        mode = "auto"
+    return mode
+
+
+def create_app(db_path=None, auth_mode=None, authenticator=None):
     app = Flask(__name__, static_folder=None)
     app.config["JSON_AS_ASCII"] = False
     app.json.ensure_ascii = False
@@ -122,7 +160,29 @@ def create_app(db_path=None):
         data_dir.mkdir(parents=True, exist_ok=True)
         db_path = data_dir / "pererabotki.db"
     app.config["DB_PATH"] = str(db_path)
-    trust_proxy = os.environ.get("PERER_TRUST_PROXY") == "1"
+    app.secret_key = load_secret_key(Path(db_path).parent)
+    app.config.update(SESSION_COOKIE_NAME="perer_session", SESSION_COOKIE_SAMESITE="Lax",
+                      SESSION_COOKIE_HTTPONLY=True, PERMANENT_SESSION_LIFETIME=12 * 3600)
+
+    auth_mode = auth_mode or resolve_auth_mode()
+    trust_proxy = auth_mode == "proxy"
+    # Встроенный вход Windows (NTLM/Kerberos): в режимах auto и windows, если сервер на Windows
+    if authenticator is None and auth_mode in ("auto", "windows") and winauth.SspiAuthenticator.available:
+        try:
+            authenticator = winauth.SspiAuthenticator()
+        except OSError as exc:
+            logging.error("Вход по учетной записи Windows недоступен: %s", exc)
+    if auth_mode == "windows" and authenticator is None:
+        logging.warning("PERER_AUTH=windows, но SSPI недоступен — работаю как auto")
+    if auth_mode not in ("auto", "windows"):
+        authenticator = None
+    allow_manual = os.environ.get("PERER_ALLOW_MANUAL", "0" if auth_mode == "windows" else "1") == "1"
+    # Kerberos требует SPN HTTP/<имя сервера> на учетке, под которой работает сервис; без него
+    # браузер получит билет, который сервис не сможет расшифровать, и вход не удастся.
+    # NTLM работает под любой учеткой, поэтому по умолчанию предлагаем только его.
+    win_schemes = ["Negotiate", "NTLM"] if os.environ.get("PERER_KERBEROS") == "1" else ["NTLM"]
+    local_os_user = auth_mode in ("auto", "off") or authenticator is None
+    app.config.update(AUTH_MODE=auth_mode, ALLOW_MANUAL=allow_manual)
 
     init_db = sqlite3.connect(app.config["DB_PATH"])
     try:
@@ -146,25 +206,48 @@ def create_app(db_path=None):
             conn.close()
 
     # ---------- Пользователь ОС ----------
+    def with_display(login, display):
+        return f"{display} ({login})" if display and display != login else login
+
     def detect_user():
-        """Возвращает (имя, источник). Источник: proxy | os | manual | unknown."""
+        """Возвращает (имя для аудита, логин, ФИО, источник).
+
+        Источник: windows | proxy | os | manual | unknown.
+        """
+        if session.get("login"):
+            return (with_display(session["login"], session.get("display")),
+                    session["login"], session.get("display"), "windows")
         header = request.headers.get("X-Remote-User") or request.environ.get("REMOTE_USER")
         if trust_proxy and header:
-            return header.strip(), "proxy"
+            login = header.strip()[:200]
+            return login, login, None, "proxy"
         ip = request.remote_addr or ""
-        if not trust_proxy and ip in ("127.0.0.1", "::1"):
+        if local_os_user and not trust_proxy and ip in ("127.0.0.1", "::1"):
             try:
-                return getpass.getuser(), "os"
+                login, display = process_user()
+                return with_display(login, display), login, display, "os"
             except Exception:  # noqa: BLE001 — getuser может падать в урезанных окружениях
                 pass
         manual = (request.cookies.get("perer_user") or "").strip()
-        if manual:
-            return manual[:100], "manual"
-        return f"unknown@{ip}", "unknown"
+        if manual and allow_manual:
+            return manual[:100], manual[:100], None, "manual"
+        return f"unknown@{ip}", None, None, "unknown"
+
+    _process_user_cache = []
+
+    def process_user():
+        # Учетка процесса не меняется — спрашиваем Windows/AD один раз
+        if not _process_user_cache:
+            _process_user_cache.append(winauth.process_user())
+        return _process_user_cache[0]
 
     @app.before_request
     def identify():
-        g.actor, g.actor_source = detect_user()
+        g.actor, g.login, g.display, g.actor_source = detect_user()
+        if (request.method not in ("GET", "HEAD", "OPTIONS") and g.actor_source == "unknown"
+                and not allow_manual and request.path != "/api/me"):
+            raise ApiError("Не удалось определить вашу учетную запись Windows. "
+                           "Изменения запрещены — обратитесь к администратору.", 401)
 
     # ---------- Аудит ----------
     def audit(action, entity, entity_id, summary, old=None, new=None):
@@ -232,14 +315,75 @@ def create_app(db_path=None):
     # ---------- Кто я ----------
     @app.get("/api/me")
     def me():
-        return jsonify({"user": g.actor, "source": g.actor_source})
+        return jsonify({
+            "user": g.actor, "login": g.login, "display": g.display, "source": g.actor_source,
+            "windows_auth": authenticator is not None, "allow_manual": allow_manual,
+            "auth_mode": auth_mode,
+        })
 
     @app.post("/api/me")
     def set_me():
-        """Запасной вариант: имя вводится вручную, если ОС-учетку определить нельзя."""
+        """Запасной вариант: имя вводится вручную, если учетку определить нельзя."""
+        if not allow_manual:
+            raise ApiError("Ввод имени вручную отключен администратором (PERER_ALLOW_MANUAL=0)", 403)
         name = clean_text((request.get_json(silent=True) or {}).get("name"), "Имя", True, 100)
         resp = jsonify({"user": name, "source": "manual"})
         resp.set_cookie("perer_user", name, max_age=60 * 60 * 24 * 365, samesite="Lax")
+        return resp
+
+    @app.get("/api/login/windows")
+    def login_windows():
+        """Вход по учетной записи Windows/AD через HTTP Negotiate (Kerberos или NTLM)."""
+        if authenticator is None:
+            raise ApiError("Вход по учетной записи Windows на этом сервере не включен", 404)
+
+        def challenge(scheme_tokens):
+            resp = jsonify({"error": "Требуется вход по учетной записи Windows"})
+            resp.status_code = 401
+            for value in scheme_tokens:
+                resp.headers.add("WWW-Authenticate", value)
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
+
+        header = request.headers.get("Authorization", "")
+        scheme, _, b64 = header.partition(" ")
+        if scheme.lower() not in ("negotiate", "ntlm") or not b64.strip():
+            return challenge(win_schemes)
+        try:
+            token = base64.b64decode(b64.strip(), validate=True)
+        except ValueError:
+            return challenge(win_schemes)
+        # NTLM требует, чтобы все шаги шли по одному TCP-соединению: ключ — IP и порт клиента
+        key = f"{request.remote_addr}:{request.environ.get('REMOTE_PORT', '')}"
+        result = authenticator.step(key, scheme, token)
+        reply_header = f"{scheme} {base64.b64encode(result.out_token).decode()}" if result.out_token else None
+        if result.failed:
+            resp = jsonify({"error": "Windows отклонила вход. Проверьте, что сайт добавлен "
+                                     "в зону «Местная интрасеть», или войдите вручную."})
+            resp.status_code = 403
+            return resp
+        if result.user is None:
+            return challenge([reply_header] if reply_header else win_schemes)
+
+        login = result.user
+        display = winauth.display_name(login)
+        session.clear()
+        session.permanent = True
+        session["login"], session["display"] = login, display
+        logging.info("Вход по учетной записи Windows: %s (%s)", login, display or "ФИО не найдено")
+        resp = jsonify({"user": with_display(login, display), "login": login, "display": display,
+                        "source": "windows"})
+        if reply_header:
+            resp.headers["WWW-Authenticate"] = reply_header  # взаимная аутентификация Kerberos
+        resp.delete_cookie("perer_user")
+        return resp
+
+    @app.post("/api/logout")
+    def logout():
+        """Сбросить вход (сменить пользователя)."""
+        session.clear()
+        resp = jsonify({"ok": True})
+        resp.delete_cookie("perer_user")
         return resp
 
     # ---------- Дежурные (сотрудники) ----------
@@ -523,14 +667,30 @@ def setup_logging(data_dir):
         sys.stderr = open(os.devnull, "w")
 
 
+def load_settings_file(path):
+    """Читает settings.env (строки КЛЮЧ=значение). Переменные окружения важнее файла."""
+    try:
+        lines = Path(path).read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip().strip('"'))
+
+
 def main():
+    load_settings_file(BASE_DIR.parent / "settings.env")
     host = os.environ.get("PERER_HOST", "127.0.0.1")
     port = int(os.environ.get("PERER_PORT", "8080"))
     data_dir = Path(os.environ.get("PERER_DATA_DIR") or BASE_DIR.parent / "data")
     data_dir.mkdir(parents=True, exist_ok=True)
     setup_logging(data_dir)
     app = create_app()
-    logging.info("Запуск на http://%s:%s", host, port)
+    logging.info("Запуск на http://%s:%s, режим определения пользователя: %s",
+                 host, port, app.config["AUTH_MODE"])
     try:
         from waitress import serve
     except ImportError:

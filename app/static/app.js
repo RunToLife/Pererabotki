@@ -3,7 +3,8 @@
 const MONTH_NAMES = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август",
   "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"];
 const SOURCE = {
-  os: ["учётная запись ОС", "green"], proxy: ["SSO через прокси", "green"],
+  windows: ["вход Windows / AD", "green"], os: ["учётная запись ОС", "green"],
+  proxy: ["SSO через прокси", "green"],
   manual: ["введено вручную", "amber"], unknown: ["не определено", "red"],
 };
 const ACTION = { create: ["Создание", "green"], update: ["Изменение", "amber"], delete: ["Удаление", "red"] };
@@ -100,16 +101,53 @@ function card(title, body, { right = "", flush = false } = {}) {
 }
 
 // ---------- Пользователь ----------
-async function loadUser() {
-  const me = await api("GET", "/api/me");
+async function loginWindows() {
+  // Браузер сам ответит на запрос Negotiate учёткой, под которой выполнен вход в Windows.
+  // Если сайт не в зоне «Местная интрасеть», браузер может спросить логин и пароль домена.
+  const res = await fetch("/api/login/windows", { credentials: "same-origin", cache: "no-store" });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Вход Windows не выполнен (${res.status})`);
+  return data;
+}
+
+async function loadUser({ tryWindows = true } = {}) {
+  let me = await api("GET", "/api/me");
+  let tried = false;
+  try { tried = sessionStorage.getItem("perer_win_tried") === "1"; } catch (_) { /* приватный режим */ }
+  if (tryWindows && me.windows_auth && !tried && (me.source === "unknown" || me.source === "manual")) {
+    try { sessionStorage.setItem("perer_win_tried", "1"); } catch (_) { /* приватный режим */ }
+    try {
+      await loginWindows();
+      me = await api("GET", "/api/me");
+    } catch (err) {
+      console.warn(err);
+    }
+  }
   const [label, color] = SOURCE[me.source] || ["", ""];
-  $("#user").innerHTML = `<span class="label">Вы вошли как</span><b>${esc(me.user)}</b>${badge(label, color)}`;
+  const main = me.display || me.user;
+  const sub = me.display && me.login ? `<small class="muted">${esc(me.login)}</small>` : "";
+  const winBtn = me.windows_auth && me.source !== "windows"
+    ? `<button type="button" class="btn" id="win-login">Войти через Windows</button>` : "";
+  $("#user").innerHTML = `<span class="label">Вы вошли как</span><b>${esc(main)}</b>${sub}${badge(label, color)}${winBtn}`;
+  const btn = $("#win-login");
+  if (btn) {
+    btn.onclick = () => guarded(async () => {
+      await loginWindows();
+      await loadUser({ tryWindows: false });
+      toast("Вход по учётной записи Windows выполнен", true);
+    });
+  }
   if (me.source === "unknown") {
+    if (!me.allow_manual) {
+      toast("Не удалось определить учётную запись Windows. Просмотр доступен, изменения — нет. " +
+        "Обратитесь к администратору (см. README, раздел «Определение пользователя»).");
+      return;
+    }
     openForm("Как вас зовут?",
-      `<p class="muted">Не удалось автоматически определить вашу учётную запись ОС.
-       Укажите имя — оно будет записываться в аудит.</p>
+      `<p class="muted">Не удалось автоматически определить вашу учётную запись Windows.
+       Укажите имя — оно будет записываться в аудит с пометкой «введено вручную».</p>
        <label><span>Имя или логин</span><input name="name" required maxlength="100"></label>`,
-      async (d) => { await api("POST", "/api/me", { name: d.name }); await loadUser(); }, "Продолжить");
+      async (d) => { await api("POST", "/api/me", { name: d.name }); await loadUser({ tryWindows: false }); }, "Продолжить");
   }
 }
 
