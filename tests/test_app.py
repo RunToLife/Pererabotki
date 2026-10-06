@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -168,6 +169,129 @@ class AppTest(unittest.TestCase):
         self.assertEqual(self.audit(entity="employee", q="Директор")["total"], 1)
         self.assertEqual(self.audit(actor="zzz-nobody")["total"], 0)
         self.assertEqual(len(self.audit(limit=1)["items"]), 1)
+
+    # --- типы дежурств и автоначисление ---
+    def hours(self, kind, month):
+        return self.c.get(f"/api/hours/{kind}?month={month}").get_json()
+
+    def test_duty_defaults_and_validation(self):
+        eid = self.emp()
+        future = (date.today() + timedelta(days=3)).isoformat()
+        d = self.c.post("/api/duties", json={"date": future, "employee_id": eid}).get_json()
+        self.assertEqual((d["kind"], d["hours"], d["role"], d["accrued_at"]), ("official", 24, "duty", None))
+        for bad in ({"kind": "x"}, {"role": "boss"}, {"hours": 0}, {"hours": 30}):
+            body = {"date": (date.today() + timedelta(days=4)).isoformat(), "employee_id": eid, **bad}
+            self.assertEqual(self.c.post("/api/duties", json=body).status_code, 400, bad)
+        # будущее дежурство ещё не начислено
+        self.assertEqual(self.hours("official", future[:7]), [])
+
+    def test_duty_accrues_on_its_day_once(self):
+        eid = self.emp()
+        future = date.today() + timedelta(days=2)
+        d = self.c.post("/api/duties", json={"date": future.isoformat(), "employee_id": eid,
+                                             "kind": "unofficial", "hours": 12, "role": "assistant"}).get_json()
+        self.assertEqual(self.app.accrue(date.today()), 0)
+        self.assertEqual(self.app.accrue(future), 1)
+        self.assertEqual(self.app.accrue(future), 0)  # повторная проверка не задваивает
+        rows = self.hours("unofficial", future.isoformat()[:7])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["hours"], rows[0]["source"], rows[0]["duty_id"]), (12, "duty", d["id"]))
+        self.assertIn("Неофициальное дежурство · Помощник дежурного · 12 ч", rows[0]["comment"])
+        self.assertEqual(self.hours("official", future.isoformat()[:7]), [])
+        a = self.audit(entity="hours_unofficial")["items"][0]
+        self.assertEqual(a["actor"], "система")
+        self.assertIn("+12 ч", a["summary"])
+
+    def test_past_duty_accrued_immediately_and_kinds_split(self):
+        eid = self.emp()
+        past = (date.today() - timedelta(days=1)).isoformat()
+        self.c.post("/api/duties", json={"date": past, "employee_id": eid, "kind": "official"})
+        eid2 = self.emp("Петров Пётр", "Техник")
+        self.c.post("/api/duties", json={"date": past, "employee_id": eid2, "kind": "unofficial", "hours": 8,
+                                         "role": "shift"})
+        off = self.hours("official", past[:7])
+        unoff = self.hours("unofficial", past[:7])
+        self.assertEqual([(r["employee_id"], r["hours"]) for r in off], [(eid, 24)])
+        self.assertEqual([(r["employee_id"], r["hours"]) for r in unoff], [(eid2, 8)])
+
+    def test_accrual_runs_on_startup(self):
+        eid = self.emp()
+        future = (date.today() + timedelta(days=1)).isoformat()
+        self.c.post("/api/duties", json={"date": future, "employee_id": eid})
+        db_path = self.app.config["DB_PATH"]
+        with sqlite3.connect(db_path) as conn:  # «день наступил»: сдвигаем дежурство на вчера
+            conn.execute("UPDATE duties SET duty_date=?", ((date.today() - timedelta(days=1)).isoformat(),))
+        create_app(db_path)
+        with sqlite3.connect(db_path) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM hours WHERE source='duty'").fetchone()[0], 1)
+
+    def test_accrued_hours_follow_duty_edit_and_delete(self):
+        eid = self.emp()
+        past = (date.today() - timedelta(days=1)).isoformat()
+        did = self.c.post("/api/duties", json={"date": past, "employee_id": eid}).get_json()["id"]
+        hid = self.hours("official", past[:7])[0]["id"]
+        # автоматическую запись нельзя править в таблице часов
+        self.assertEqual(self.c.delete(f"/api/hours/official/{hid}").status_code, 409)
+        self.assertEqual(self.c.put(f"/api/hours/official/{hid}", json={"date": past, "employee_id": eid,
+                                                                        "hours": 1}).status_code, 409)
+        r = self.c.put(f"/api/duties/{did}", json={"kind": "unofficial", "hours": 10, "role": "other"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.hours("official", past[:7]), [])
+        self.assertEqual(self.hours("unofficial", past[:7])[0]["hours"], 10)
+        self.c.delete(f"/api/duties/{did}")
+        self.assertEqual(self.hours("unofficial", past[:7]), [])
+        self.assertEqual(self.audit(entity="duty", q="Изменил")["total"], 1)
+
+    # --- отгулы ---
+    def test_dayoff_writes_off_from_chosen_table(self):
+        eid = self.emp()
+        day = "2026-09-10"
+        self.c.post("/api/hours/official", json={"date": "2026-09-01", "employee_id": eid, "hours": 20})
+        r = self.c.post("/api/dayoffs", json={"date": day, "employee_id": eid})
+        self.assertEqual(r.status_code, 201, r.get_json())
+        off = r.get_json()
+        self.assertEqual((off["kind"], off["hours"]), ("official", 8))
+        rows = self.hours("official", "2026-09")
+        self.assertEqual(sorted(x["hours"] for x in rows), [-8, 20])
+        bal = self.c.get("/api/balance").get_json()[0]
+        self.assertEqual((bal["official"], bal["unofficial"]), (12, 0))
+        self.assertEqual(self.c.post("/api/dayoffs", json={"date": day, "employee_id": eid}).status_code, 409)
+        # смена типа часов переносит списание в другую таблицу
+        self.c.put(f"/api/dayoffs/{off['id']}", json={"kind": "unofficial", "hours": 4})
+        self.assertEqual([x["hours"] for x in self.hours("unofficial", "2026-09")], [-4])
+        self.assertEqual([x["hours"] for x in self.hours("official", "2026-09")], [20])
+        # отмена отгула возвращает часы
+        self.c.delete(f"/api/dayoffs/{off['id']}")
+        self.assertEqual(self.hours("unofficial", "2026-09"), [])
+        self.assertEqual(self.c.get("/api/dayoffs?month=2026-09").get_json(), [])
+        self.assertGreaterEqual(self.audit(entity="dayoff")["total"], 3)
+        self.assertIn("−8 ч", self.audit(entity="hours_official", q="Списал")["items"][0]["summary"])
+
+    def test_dayoff_validation(self):
+        eid = self.emp()
+        for bad in ({"kind": "x"}, {"hours": 0}, {"hours": 25}, {"date": "bad"}, {"employee_id": 999}):
+            body = {"date": "2026-09-10", "employee_id": eid, **bad}
+            self.assertIn(self.c.post("/api/dayoffs", json=body).status_code, (400, 404), bad)
+
+    def test_migrates_old_database(self):
+        db_path = os.path.join(self.tmp.name, "old.db")
+        with sqlite3.connect(db_path) as conn:
+            conn.executescript("""
+                CREATE TABLE employees (id INTEGER PRIMARY KEY AUTOINCREMENT, full_name TEXT NOT NULL,
+                    position TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
+                CREATE TABLE duties (id INTEGER PRIMARY KEY AUTOINCREMENT, duty_date TEXT NOT NULL,
+                    employee_id INTEGER NOT NULL, note TEXT NOT NULL DEFAULT '', UNIQUE (duty_date, employee_id));
+                CREATE TABLE hours (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, work_date TEXT NOT NULL,
+                    employee_id INTEGER NOT NULL, hours REAL NOT NULL, comment TEXT NOT NULL DEFAULT '',
+                    created_by TEXT NOT NULL, created_at TEXT NOT NULL);
+                INSERT INTO employees (full_name, position, created_at) VALUES ('Старый', 'Инженер', '2026-01-01');
+                INSERT INTO duties (duty_date, employee_id) VALUES ('2026-01-05', 1);
+            """)
+        c = create_app(db_path).test_client()
+        d = c.get("/api/duties?month=2026-01").get_json()[0]
+        self.assertEqual((d["kind"], d["hours"], d["role"]), ("official", 24, "duty"))
+        # прошлые дежурства из старой базы задним числом не начисляются (часы могли внести вручную)
+        self.assertEqual(c.get("/api/hours/official?month=2026-01").get_json(), [])
 
     def test_index_served(self):
         r = self.c.get("/")
