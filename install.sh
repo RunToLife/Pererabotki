@@ -41,14 +41,29 @@ if [ -z "$PY" ]; then
 fi
 echo "Используется: $($PY --version) ($(command -v "$PY"))"
 
-# ---------- 2. Виртуальное окружение и зависимости ----------
+# ---------- 2. Виртуальное окружение и зависимости (офлайн) ----------
+# Все библиотеки лежат в vendor/wheels — интернет не нужен.
+WHEELS="$ROOT/vendor/wheels"
+[ -d "$WHEELS" ] || die "Не найдена папка $WHEELS с библиотеками. Скопируйте проект целиком."
+PIP_WHL="$(ls "$WHEELS"/pip-*.whl 2>/dev/null | head -n1 || true)"
+
 say "Создание виртуального окружения (venv)"
 if [ ! -x "venv/bin/python" ]; then
-  "$PY" -m venv venv || die "Не удалось создать venv. В Debian/Ubuntu установите пакет python3-venv и повторите."
+  if ! "$PY" -m venv venv >/dev/null 2>&1; then
+    # Debian/Ubuntu без пакета python3-venv: нет ensurepip. Создаём venv без pip,
+    # а pip берём из vendor/wheels.
+    rm -rf venv
+    "$PY" -m venv --without-pip venv || die "Не удалось создать venv. В Debian/Ubuntu установите пакет python3-venv и повторите."
+  fi
 fi
-say "Установка зависимостей"
-venv/bin/python -m pip install --disable-pip-version-check -q --upgrade pip
-venv/bin/python -m pip install --disable-pip-version-check -q -r requirements.txt
+say "Установка зависимостей из vendor/wheels (без интернета)"
+PIP_OPTS=(--disable-pip-version-check -q --no-index --find-links "$WHEELS")
+if venv/bin/python -m pip --version >/dev/null 2>&1; then
+  venv/bin/python -m pip install "${PIP_OPTS[@]}" -r requirements.txt
+else
+  [ -n "$PIP_WHL" ] || die "В $WHEELS нет pip-*.whl"
+  venv/bin/python "$PIP_WHL/pip" install "${PIP_OPTS[@]}" -r requirements.txt
+fi
 mkdir -p data
 
 # ---------- 3. Автозапуск ----------

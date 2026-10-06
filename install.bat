@@ -18,8 +18,20 @@ where py >nul 2>nul && (py -3 -c "import sys; sys.exit(0 if sys.version_info>=(3
 if not defined PY (
   where python >nul 2>nul && (python -c "import sys; sys.exit(0 if sys.version_info>=(3,8) else 1)" >nul 2>nul && set "PY=python")
 )
+if not defined PY if exist "%ROOT%\runtime\python\python.exe" set "PY="%ROOT%\runtime\python\python.exe""
+if not defined PY if exist "%ROOT%\vendor\python\python-3.12.10-win-amd64.zip" (
+  echo Python 3.8+ не найден. Распаковываю встроенный Python 3.12 из vendor\python ^(без интернета^)...
+  if exist "%ROOT%\runtime\_unpack" rmdir /s /q "%ROOT%\runtime\_unpack"
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -LiteralPath '%ROOT%\vendor\python\python-3.12.10-win-amd64.zip' -DestinationPath '%ROOT%\runtime\_unpack' -Force"
+  if exist "%ROOT%\runtime\_unpack\tools\python.exe" (
+    if exist "%ROOT%\runtime\python" rmdir /s /q "%ROOT%\runtime\python"
+    move "%ROOT%\runtime\_unpack\tools" "%ROOT%\runtime\python" >nul
+    rmdir /s /q "%ROOT%\runtime\_unpack"
+  )
+  if exist "%ROOT%\runtime\python\python.exe" set "PY="%ROOT%\runtime\python\python.exe""
+)
 if not defined PY (
-  echo Python 3.8+ не найден. Пробую установить через winget...
+  echo Python 3.8+ не найден и встроенный Python недоступен. Пробую установить через winget ^(нужен интернет^)...
   where winget >nul 2>nul
   if errorlevel 1 (
     echo ОШИБКА: winget недоступен. Установите Python 3.8+ с https://www.python.org/downloads/ ^(отметьте "Add python.exe to PATH"^) и запустите скрипт снова.
@@ -32,7 +44,7 @@ if not defined PY (
     echo Python установлен, но окно нужно перезапустить. Закройте это окно и запустите install.bat ещё раз.
     exit /b 1
   )
-  set "PY=!PY!"
+  set "PY="!PY!""
 )
 %PY% --version
 
@@ -42,9 +54,9 @@ if not exist "venv\Scripts\python.exe" (
   %PY% -m venv venv
   if errorlevel 1 ( echo ОШИБКА: не удалось создать venv & exit /b 1 )
 )
-echo ==^> Установка зависимостей
-"venv\Scripts\python.exe" -m pip install --disable-pip-version-check -q --upgrade pip
-"venv\Scripts\python.exe" -m pip install --disable-pip-version-check -q -r requirements.txt
+echo ==^> Установка зависимостей из vendor\wheels ^(без интернета^)
+if not exist "%ROOT%\vendor\wheels" ( echo ОШИБКА: нет папки vendor\wheels с библиотеками. Скопируйте проект целиком. & exit /b 1 )
+"venv\Scripts\python.exe" -m pip install --disable-pip-version-check -q --no-index --find-links "%ROOT%\vendor\wheels" -r requirements.txt
 if errorlevel 1 ( echo ОШИБКА: не удалось установить зависимости & exit /b 1 )
 if not exist data mkdir data
 
