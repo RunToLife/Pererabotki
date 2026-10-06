@@ -8,11 +8,17 @@ const SOURCE = {
 };
 const ACTION = { create: ["Создание", "green"], update: ["Изменение", "amber"], delete: ["Удаление", "red"] };
 const TABS = {
-  schedule: ["Раздел 01", "График дежурств"], official: ["Раздел 02", "Официальные часы"],
-  unofficial: ["Раздел 03", "Неофициальные часы"], employees: ["Раздел 04", "Дежурные"],
-  audit: ["Раздел 05", "Журнал аудита"],
+  schedule: ["Раздел 01", "График дежурств"], dayoffs: ["Раздел 02", "График отгулов"],
+  official: ["Раздел 03", "Официальные часы"], unofficial: ["Раздел 04", "Неофициальные часы"],
+  employees: ["Раздел 05", "Дежурные"], audit: ["Раздел 06", "Журнал аудита"],
 };
 const KIND_BADGE = { official: "green", unofficial: "amber" };
+const DUTY_KIND = { official: "Официальное", unofficial: "Неофициальное" };
+const HOURS_KIND = { official: "Официальные часы", unofficial: "Неофициальные часы" };
+const ROLE = { duty: "Дежурный", assistant: "Помощник дежурного", shift: "Смена", other: "Иное" };
+const ROLE_SHORT = { duty: "Деж.", assistant: "Пом.", shift: "Смена", other: "Иное" };
+const DEFAULT_DUTY_HOURS = 24;
+const DEFAULT_DAYOFF_HOURS = 8;
 
 const $ = (sel) => document.querySelector(sel);
 const view = $("#view");
@@ -25,6 +31,10 @@ function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 function fmtNum(n) { return Number(n).toLocaleString("ru-RU", { maximumFractionDigits: 2 }); }
+function fmtSigned(n) { return (n > 0 ? "+" : n < 0 ? "−" : "") + fmtNum(Math.abs(n)); }
+function options(map, selected) {
+  return Object.entries(map).map(([v, t]) => `<option value="${v}" ${v === selected ? "selected" : ""}>${esc(t)}</option>`).join("");
+}
 function monthTitle(m) { const [y, mo] = m.split("-").map(Number); return `${MONTH_NAMES[mo - 1]} ${y}`; }
 function shiftMonth(m, delta) {
   const [y, mo] = m.split("-").map(Number);
@@ -113,55 +123,151 @@ async function loadUser() {
   }
 }
 
-// ---------- График дежурств ----------
-async function renderSchedule() {
-  const duties = await api("GET", `/api/duties?month=${state.month}`);
+// ---------- Календарь (общий для графика дежурств и отгулов) ----------
+/** items — записи месяца; dateOf(x) — дата записи; chip(x) — HTML плашки; addLabel — подсказка кнопки «+». */
+function calendar(items, dateOf, chip, addLabel) {
   const [y, mo] = state.month.split("-").map(Number);
   const days = new Date(y, mo, 0).getDate();
   const offset = (new Date(y, mo - 1, 1).getDay() + 6) % 7; // неделя с понедельника
   const byDay = {};
-  duties.forEach((d) => (byDay[d.duty_date] = byDay[d.duty_date] || []).push(d));
-
+  items.forEach((x) => (byDay[dateOf(x)] = byDay[dateOf(x)] || []).push(x));
   let cells = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"].map((n) => `<div class="dow">${n}</div>`).join("");
   cells += '<div class="day out"></div>'.repeat(offset);
   for (let d = 1; d <= days; d++) {
     const date = `${state.month}-${pad(d)}`;
     const dow = (offset + d - 1) % 7;
     const cls = ["day", dow >= 5 ? "weekend" : "", date === todayStr() ? "today" : ""].join(" ");
-    const chips = (byDay[date] || []).map((x) =>
-      `<div class="chip" title="${esc(x.full_name)} — ${esc(x.position)}${x.note ? "\n" + esc(x.note) : ""}">
-         <span>${esc(x.full_name)}${x.note ? " · " + esc(x.note) : ""}</span>
-         <button data-del-duty="${x.id}" title="Снять с дежурства" aria-label="Снять с дежурства">×</button></div>`).join("");
     cells += `<div class="${cls}"><div class="dnum"><span>${pad(d)}</span>
-      <button class="add" data-add-duty="${date}" title="Назначить дежурного" aria-label="Назначить дежурного на ${date}">+</button></div>${chips}</div>`;
+      <button class="add" data-add="${date}" title="${esc(addLabel)}" aria-label="${esc(addLabel)} на ${date}">+</button></div>
+      ${(byDay[date] || []).map(chip).join("")}</div>`;
   }
+  return `<div class="calendar">${cells}</div>`;
+}
 
-  const counts = {};
+// ---------- График дежурств ----------
+function dutyFields(x) {
+  const v = x || { kind: "official", hours: DEFAULT_DUTY_HOURS, role: "duty", note: "" };
+  return `${x ? "" : `<label><span>Дежурный</span><select name="employee_id">${employeeOptions()}</select></label>`}
+    <label><span>Тип дежурства</span><select name="kind">${options(DUTY_KIND, v.kind)}</select></label>
+    <label><span>Роль</span><select name="role">${options(ROLE, v.role)}</select></label>
+    <label><span>Часы (по умолчанию ${DEFAULT_DUTY_HOURS})</span><input type="number" name="hours" min="0.25" max="24" step="0.25" value="${v.hours}" required></label>
+    <label><span>Примечание (необязательно)</span><input name="note" maxlength="300" value="${esc(v.note)}" placeholder="например, ночная смена"></label>
+    <p class="muted">Часы автоматически попадут в таблицу «${esc(HOURS_KIND.official)}» или «${esc(HOURS_KIND.unofficial)}» (по типу дежурства) при наступлении дня дежурства.</p>`;
+}
+
+async function renderSchedule() {
+  const duties = await api("GET", `/api/duties?month=${state.month}`);
+  const chip = (x) => {
+    const title = `${x.full_name} — ${x.position}\n${DUTY_KIND[x.kind]} дежурство · ${ROLE[x.role] || x.role} · ${fmtNum(x.hours)} ч`
+      + (x.note ? `\n${x.note}` : "") + (x.accrued_at ? "\nЧасы начислены" : "\nЧасы будут начислены в день дежурства");
+    return `<div class="chip ${x.kind}" title="${esc(title)}">
+      <button class="edit" data-edit-duty="${x.id}">${esc(x.full_name)}
+        <small>${x.accrued_at ? '<b class="ok">✓</b> ' : ""}${esc(ROLE_SHORT[x.role] || x.role)} · ${fmtNum(x.hours)} ч</small></button>
+      <button data-del-duty="${x.id}" title="Снять с дежурства" aria-label="Снять с дежурства">×</button></div>`;
+  };
+
+  const stats = {};
   duties.forEach((d) => {
-    counts[d.employee_id] = counts[d.employee_id] || { name: d.full_name, position: d.position, n: 0 };
-    counts[d.employee_id].n++;
+    const s = (stats[d.employee_id] = stats[d.employee_id] || { name: d.full_name, position: d.position, n: 0, official: 0, unofficial: 0 });
+    s.n++; s[d.kind] += d.hours;
   });
-  const rank = Object.values(counts).sort((a, b) => b.n - a.n || a.name.localeCompare(b.name, "ru"))
+  const rank = Object.values(stats).sort((a, b) => b.n - a.n || a.name.localeCompare(b.name, "ru"))
     .map((c) => `<li><div class="who"><b>${esc(c.name)}</b><small>${esc(c.position)}</small></div>
-      <div class="nums"><span><em>дежурств</em><b>${c.n}</b></span></div></li>`).join("");
+      <div class="nums"><span><em>дежурств</em><b>${c.n}</b></span><span><em>офиц. ч</em><b>${fmtNum(c.official)}</b></span>
+      <span><em>неофиц. ч</em><b>${fmtNum(c.unofficial)}</b></span></div></li>`).join("");
+  const legend = `<div class="legend">${badge("Официальное", "green")}${badge("Неофициальное", "amber")}
+    <span>Деж. — дежурный, Пом. — помощник дежурного · ✓ — часы начислены · нажмите на плашку, чтобы изменить</span></div>`;
 
   view.innerHTML = `<div class="split">
-    ${card(monthTitle(state.month), `<div class="calendar">${cells}</div>`,
+    ${card(monthTitle(state.month), calendar(duties, (d) => d.duty_date, chip, "Назначить дежурного") + legend,
       { right: badge(`${duties.length} ${plural(duties.length, ["дежурство", "дежурства", "дежурств"])}`, duties.length ? "green" : "") })}
     <aside class="rail">${card("По сотрудникам", rank ? `<ul class="kv">${rank}</ul>` : '<div class="empty">В этом месяце дежурств нет.</div>', { flush: true })}</aside>
   </div>`;
 
-  view.querySelectorAll("[data-add-duty]").forEach((btn) => (btn.onclick = () => {
+  const payload = (d) => ({ kind: d.kind, role: d.role, hours: Number(d.hours), note: d.note });
+  view.querySelectorAll("[data-add]").forEach((btn) => (btn.onclick = () => {
     if (!state.employees.length) return toast("Сначала добавьте дежурных на вкладке «Дежурные»");
-    const date = btn.dataset.addDuty;
-    openForm(`Дежурство ${date}`,
-      `<label><span>Дежурный</span><select name="employee_id">${employeeOptions()}</select></label>
-       <label><span>Примечание (необязательно)</span><input name="note" maxlength="300" placeholder="например, ночная смена"></label>`,
-      async (d) => { await api("POST", "/api/duties", { date, employee_id: Number(d.employee_id), note: d.note }); await render(); },
+    const date = btn.dataset.add;
+    openForm(`Дежурство ${date}`, dutyFields(),
+      async (d) => { await api("POST", "/api/duties", { date, employee_id: Number(d.employee_id), ...payload(d) }); await render(); },
       "Назначить");
   }));
-  view.querySelectorAll("[data-del-duty]").forEach((btn) => (btn.onclick = () =>
-    guarded(async () => { await api("DELETE", `/api/duties/${btn.dataset.delDuty}`); await render(); })));
+  view.querySelectorAll("[data-edit-duty]").forEach((btn) => (btn.onclick = () => {
+    const x = duties.find((d) => d.id === Number(btn.dataset.editDuty));
+    openForm(`Дежурство ${x.duty_date}: ${x.full_name}`, dutyFields(x),
+      async (d) => { await api("PUT", `/api/duties/${x.id}`, payload(d)); await render(); });
+  }));
+  view.querySelectorAll("[data-del-duty]").forEach((btn) => (btn.onclick = () => {
+    const x = duties.find((d) => d.id === Number(btn.dataset.delDuty));
+    if (x.accrued_at && x.accrued_at !== "до автоначисления"
+        && !confirm(`Снять ${x.full_name} с дежурства ${x.duty_date}?\nНачисленные ${fmtNum(x.hours)} ч будут удалены из таблицы «${HOURS_KIND[x.kind]}».`)) return;
+    guarded(async () => { await api("DELETE", `/api/duties/${x.id}`); await render(); });
+  }));
+}
+
+// ---------- График отгулов ----------
+function dayoffFields(x) {
+  const v = x || { kind: "official", hours: DEFAULT_DAYOFF_HOURS, note: "" };
+  return `${x ? "" : `<label><span>Сотрудник</span><select name="employee_id">${employeeOptions()}</select></label>`}
+    <label><span>Списать часы из</span><select name="kind">${options(HOURS_KIND, v.kind)}</select></label>
+    <label><span>Часы (по умолчанию ${DEFAULT_DAYOFF_HOURS})</span><input type="number" name="hours" min="0.25" max="24" step="0.25" value="${v.hours}" required></label>
+    <label><span>Примечание (необязательно)</span><input name="note" maxlength="300" value="${esc(v.note)}"></label>
+    <p class="muted">Часы сразу спишутся из выбранной таблицы (запись со знаком «−» на дату отгула). При отмене отгула часы вернутся.</p>`;
+}
+
+async function renderDayoffs() {
+  const [offs, balance] = await Promise.all([
+    api("GET", `/api/dayoffs?month=${state.month}`), api("GET", "/api/balance"),
+  ]);
+  const chip = (x) => {
+    const title = `${x.full_name} — ${x.position}\nОтгул: списано ${fmtNum(x.hours)} ч из «${HOURS_KIND[x.kind]}»` + (x.note ? `\n${x.note}` : "");
+    return `<div class="chip off" title="${esc(title)}">
+      <button class="edit" data-edit-off="${x.id}">${esc(x.full_name)}
+        <small>−${fmtNum(x.hours)} ч ${x.kind === "official" ? "офиц." : "неофиц."}</small></button>
+      <button data-del-off="${x.id}" title="Отменить отгул" aria-label="Отменить отгул">×</button></div>`;
+  };
+  const num = (n) => `<b class="${n < 0 ? "neg" : ""}">${fmtNum(n)}</b>`;
+  const bal = balance.map((b) => `<li><div class="who"><b>${esc(b.full_name)}</b><small>${esc(b.position)}</small></div>
+    <div class="nums"><span><em>офиц.</em>${num(b.official)}</span><span><em>неофиц.</em>${num(b.unofficial)}</span></div></li>`).join("");
+  const total = offs.reduce((s, x) => s + x.hours, 0);
+
+  view.innerHTML = `<div class="split">
+    ${card(monthTitle(state.month), calendar(offs, (x) => x.off_date, chip, "Поставить отгул")
+      + '<div class="legend"><span>Нажмите на плашку, чтобы изменить отгул; × — отменить и вернуть часы</span></div>',
+      { right: badge(`${offs.length} ${plural(offs.length, ["отгул", "отгула", "отгулов"])} · ${fmtNum(total)} ч`, offs.length ? "red" : "") })}
+    <aside class="rail">${card("Остаток часов", bal ? `<ul class="kv">${bal}</ul><p class="muted" style="padding:0 16px 12px">За всё время: начислено минус списано.</p>`
+      : '<div class="empty">Нет дежурных.</div>', { flush: true })}</aside>
+  </div>`;
+
+  const balanceOf = (id) => balance.find((b) => b.employee_id === id) || { official: 0, unofficial: 0 };
+  const payload = (d) => ({ kind: d.kind, hours: Number(d.hours), note: d.note });
+  const warnIfShort = (id, d, already = 0) => {
+    const left = balanceOf(id)[d.kind] + already - Number(d.hours);
+    return left >= 0 || confirm(`После списания остаток в «${HOURS_KIND[d.kind]}» станет ${fmtNum(left)} ч (меньше нуля). Всё равно поставить отгул?`);
+  };
+  view.querySelectorAll("[data-add]").forEach((btn) => (btn.onclick = () => {
+    if (!state.employees.length) return toast("Сначала добавьте дежурных на вкладке «Дежурные»");
+    const date = btn.dataset.add;
+    openForm(`Отгул ${date}`, dayoffFields(), async (d) => {
+      if (!warnIfShort(Number(d.employee_id), d)) throw new Error("Отгул не поставлен");
+      await api("POST", "/api/dayoffs", { date, employee_id: Number(d.employee_id), ...payload(d) });
+      await render();
+      toast(`Списано ${fmtNum(d.hours)} ч из «${HOURS_KIND[d.kind]}»`, true);
+    }, "Поставить отгул");
+  }));
+  view.querySelectorAll("[data-edit-off]").forEach((btn) => (btn.onclick = () => {
+    const x = offs.find((o) => o.id === Number(btn.dataset.editOff));
+    openForm(`Отгул ${x.off_date}: ${x.full_name}`, dayoffFields(x), async (d) => {
+      if (!warnIfShort(x.employee_id, d, d.kind === x.kind ? x.hours : 0)) throw new Error("Отгул не изменён");
+      await api("PUT", `/api/dayoffs/${x.id}`, payload(d));
+      await render();
+    });
+  }));
+  view.querySelectorAll("[data-del-off]").forEach((btn) => (btn.onclick = () => {
+    const x = offs.find((o) => o.id === Number(btn.dataset.delOff));
+    if (!confirm(`Отменить отгул ${x.full_name} ${x.off_date}?\n${fmtNum(x.hours)} ч вернутся в «${HOURS_KIND[x.kind]}».`)) return;
+    guarded(async () => { await api("DELETE", `/api/dayoffs/${x.id}`); await render(); toast("Отгул отменён, часы возвращены", true); });
+  }));
 }
 
 // ---------- Часы ----------
@@ -199,17 +305,25 @@ async function renderHours(kind) {
     api("GET", `/api/duties?month=${state.month}`),
   ]);
   const total = rows.reduce((s, r) => s + r.hours, 0);
-  const body = rows.map((r) => `<tr><td class="mono">${esc(r.work_date)}</td>
+  const SOURCE_BADGE = { duty: ["Дежурство", KIND_BADGE[kind]], dayoff: ["Отгул", "red"], manual: ["Вручную", ""] };
+  const body = rows.map((r) => {
+    const [label, color] = SOURCE_BADGE[r.source] || SOURCE_BADGE.manual;
+    const actions = r.source === "manual"
+      ? `<button class="btn sm warn" data-edit="${r.id}">Изменить</button><button class="btn sm danger" data-del="${r.id}">Удалить</button>`
+      : `<span class="muted" title="Запись создана по графику — меняйте её в графике ${r.source === "duty" ? "дежурств" : "отгулов"}">авто</span>`;
+    return `<tr><td class="mono nowrap">${esc(r.work_date)}</td>
     <td>${esc(r.full_name)}<span class="sub">${esc(r.position)}</span></td>
-    <td class="num">${fmtNum(r.hours)}</td><td>${esc(r.comment)}</td><td class="mono muted">${esc(r.created_by)}</td>
-    <td class="actions"><button class="btn sm warn" data-edit="${r.id}">Изменить</button><button class="btn sm danger" data-del="${r.id}">Удалить</button></td></tr>`).join("");
+    <td>${badge(label, color)}</td>
+    <td class="num ${r.hours < 0 ? "neg" : "pos"}">${fmtSigned(r.hours)}</td><td>${esc(r.comment)}</td><td class="mono muted">${esc(r.created_by)}</td>
+    <td class="actions">${actions}</td></tr>`;
+  }).join("");
   const sumRows = summary.map((s) => `<li><div class="who"><b>${esc(s.full_name)}</b><small>${esc(s.position)}</small></div>
     <div class="nums"><span><em>офиц.</em><b>${fmtNum(s.official)}</b></span><span><em>неофиц.</em><b>${fmtNum(s.unofficial)}</b></span>
     <span><em>всего</em><b>${fmtNum(s.total)}</b></span></div></li>`).join("");
 
   const table = rows.length
-    ? `<div class="table-wrap"><table><thead><tr><th>Дата</th><th>Сотрудник</th><th class="num">Часы</th><th>Комментарий</th><th>Внёс</th><th></th></tr></thead>
-       <tbody>${body}</tbody><tfoot><tr><td colspan="2">Итого за месяц</td><td class="num">${fmtNum(total)}</td><td colspan="3"></td></tr></tfoot></table></div>`
+    ? `<div class="table-wrap"><table><thead><tr><th>Дата</th><th>Сотрудник</th><th>Основание</th><th class="num">Часы</th><th>Тип дежурства / комментарий</th><th>Внёс</th><th></th></tr></thead>
+       <tbody>${body}</tbody><tfoot><tr><td colspan="3" title="Начислено минус списано">Итого за месяц</td><td class="num">${fmtNum(total)}</td><td colspan="3"></td></tr></tfoot></table></div>`
     : '<div class="empty">Записей за этот месяц нет.</div>';
 
   view.innerHTML = `<div class="split">
@@ -284,7 +398,8 @@ async function renderEmployees() {
     guarded(async () => {
       const r = await api("DELETE", `/api/employees/${emp.id}`);
       await render();
-      toast(r.removed_future_duties ? `Удалено. Снято будущих дежурств: ${r.removed_future_duties}` : "Дежурный удалён", true);
+      toast(r.removed_future_duties || r.removed_future_dayoffs
+        ? `Удалено. Снято будущих дежурств: ${r.removed_future_duties}, отгулов: ${r.removed_future_dayoffs}` : "Дежурный удалён", true);
     });
   }));
 }
@@ -326,7 +441,7 @@ async function renderAudit() {
   view.innerHTML = `<div class="split single">
     ${card("Фильтры", `<form id="auditform" class="filters">
       <label><span>Раздел</span><select name="entity"><option value="">Все</option>
-        <option value="employee">Список дежурных</option><option value="duty">График дежурств</option>
+        <option value="employee">Список дежурных</option><option value="duty">График дежурств</option><option value="dayoff">График отгулов</option>
         <option value="hours_official">Официальные часы</option><option value="hours_unofficial">Неофициальные часы</option></select></label>
       <label><span>Кто изменил</span><input name="actor" value="${esc(auditFilters.actor)}"></label>
       <label class="grow"><span>Поиск по описанию</span><input name="q" value="${esc(auditFilters.q)}"></label>
@@ -356,7 +471,7 @@ async function refreshHistory() {
 }
 
 async function render() {
-  const usesMonth = ["schedule", "official", "unofficial"].includes(state.tab);
+  const usesMonth = ["schedule", "dayoffs", "official", "unofficial"].includes(state.tab);
   $("#monthbar").hidden = !usesMonth;
   $("#month").value = state.month;
   $("#eyebrow").textContent = TABS[state.tab][0];
@@ -366,6 +481,7 @@ async function render() {
     state.employees = await api("GET", "/api/employees");
     if (usesMonth) await refreshHistory();
     if (state.tab === "schedule") await renderSchedule();
+    else if (state.tab === "dayoffs") await renderDayoffs();
     else if (state.tab === "employees") await renderEmployees();
     else if (state.tab === "audit") await renderAudit();
     else await renderHours(state.tab);
