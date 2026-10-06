@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Переработка</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Переработка</h1>
+    <nav id="tabs" class="tabs" role="tablist">
+      <button data-tab="schedule" class="active">График дежурств</button>
+      <button data-tab="official">Официальные часы</button>
+      <button data-tab="unofficial">Неофициальные часы</button>
+      <button data-tab="employees">Дежурные</button>
+      <button data-tab="audit">Аудит</button>
+    </nav>
+    <div id="user" class="user" title="Учётная запись, под которой вы подключились"></div>
+  </header>
+
+  <main>
+    <div id="monthbar" class="monthbar">
+      <button id="prev" title="Предыдущий месяц">‹</button>
+      <input type="month" id="month">
+      <button id="next" title="Следующий месяц">›</button>
+      <button id="today">Текущий месяц</button>
+      <select id="history" title="Месяцы, за которые есть данные"></select>
+    </div>
+    <div id="toast" class="toast" hidden></div>
+    <section id="view"></section>
+  </main>
+
+  <dialog id="dialog"></dialog>
+  <script src="/static/app.js"></script>
+</body>
+</html>
