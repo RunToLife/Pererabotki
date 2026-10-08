@@ -162,7 +162,10 @@ async function loadUser({ tryWindows = true } = {}) {
 }
 
 // ---------- Остаток часов (таблица balances, одна на все окна) ----------
-function balNum(n) { return `<b class="${n < 0 ? "neg" : ""}">${fmtNum(n)}</b>`; }
+function balNum(n, planned = 0) {
+  return `<b class="${n < 0 ? "neg" : ""}">${fmtNum(n)}</b>`
+    + (planned ? `<small class="planned" title="Ещё начислится по графику, когда наступят дни дежурств">+${fmtNum(planned)} впереди</small>` : "");
+}
 function balanceOf(id) {
   const e = state.employees.find((x) => x.id === id);
   return e ? { official: e.balance_official, unofficial: e.balance_unofficial } : { official: 0, unofficial: 0 };
@@ -170,9 +173,9 @@ function balanceOf(id) {
 /** Карточка «Остаток часов»: начислено минус списано за всё время, по каждому дежурному. */
 function balanceCard() {
   const items = state.employees.map((e) => `<li><div class="who"><b>${esc(e.full_name)}</b><small>${esc(e.position)}</small></div>
-    <div class="nums"><span><em>офиц.</em>${balNum(e.balance_official)}</span><span><em>неофиц.</em>${balNum(e.balance_unofficial)}</span></div></li>`).join("");
+    <div class="nums"><span><em>офиц.</em>${balNum(e.balance_official, e.planned_official)}</span><span><em>неофиц.</em>${balNum(e.balance_unofficial, e.planned_unofficial)}</span></div></li>`).join("");
   return card("Остаток часов", items
-    ? `<ul class="kv">${items}</ul><p class="muted" style="padding:0 16px 12px">За всё время: начислено минус списано.</p>`
+    ? `<ul class="kv">${items}</ul><p class="muted" style="padding:0 16px 12px">За всё время: начислено минус списано. «Впереди» — часы будущих дежурств, начислятся в день дежурства.</p>`
     : '<div class="empty">Нет дежурных.</div>', { flush: true });
 }
 
@@ -434,8 +437,8 @@ function employeeFields(e) {
 
 async function renderEmployees() {
   const rows = state.employees.map((e) => `<tr><td>${esc(e.full_name)}</td><td>${esc(e.position)}</td>
-    <td class="num ${e.balance_official < 0 ? "neg" : ""}">${fmtNum(e.balance_official)}</td>
-    <td class="num ${e.balance_unofficial < 0 ? "neg" : ""}">${fmtNum(e.balance_unofficial)}</td>
+    <td class="num">${balNum(e.balance_official, e.planned_official)}</td>
+    <td class="num">${balNum(e.balance_unofficial, e.planned_unofficial)}</td>
     <td class="actions"><button class="btn sm warn" data-edit="${e.id}">Изменить</button><button class="btn sm danger" data-del="${e.id}">Удалить</button></td></tr>`).join("");
   const table = rows
     ? `<div class="table-wrap"><table><thead><tr><th>ФИО</th><th>Должность</th><th class="num" title="Остаток за всё время: начислено минус списано">Офиц. ч</th><th class="num" title="Остаток за всё время: начислено минус списано">Неофиц. ч</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`

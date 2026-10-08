@@ -285,13 +285,37 @@ class AppTest(unittest.TestCase):
                     employee_id INTEGER NOT NULL, hours REAL NOT NULL, comment TEXT NOT NULL DEFAULT '',
                     created_by TEXT NOT NULL, created_at TEXT NOT NULL);
                 INSERT INTO employees (full_name, position, created_at) VALUES ('Старый', 'Инженер', '2026-01-01');
+                INSERT INTO employees (full_name, position, created_at) VALUES ('Второй', 'Техник', '2026-01-01');
+                INSERT INTO employees (full_name, position, created_at) VALUES ('Третий', 'Техник', '2026-01-01');
                 INSERT INTO duties (duty_date, employee_id) VALUES ('2026-01-05', 1);
+                INSERT INTO duties (duty_date, employee_id) VALUES ('2026-01-06', 2);
+                INSERT INTO duties (duty_date, employee_id) VALUES ('2026-01-07', 3);
+                INSERT INTO hours (kind, work_date, employee_id, hours, created_by, created_at)
+                    VALUES ('official', '2026-01-07', 3, 5, 'x', '2026-01-07');
             """)
         c = create_app(db_path).test_client()
         d = c.get("/api/duties?month=2026-01").get_json()[0]
         self.assertEqual((d["kind"], d["hours"], d["role"]), ("official", 24, "duty"))
-        # прошлые дежурства из старой базы задним числом не начисляются (часы могли внести вручную)
-        self.assertEqual(c.get("/api/hours/official?month=2026-01").get_json(), [])
+        # прошлые дежурства старой базы начисляются у всех, кроме дня, где часы уже внесены вручную
+        rows = c.get("/api/hours/official?month=2026-01").get_json()
+        self.assertEqual(sorted((r["employee_id"], r["hours"], r["source"]) for r in rows),
+                         [(1, 24, "duty"), (2, 24, "duty"), (3, 5, "manual")])
+        bal = {b["employee_id"]: b["official"] for b in c.get("/api/balance").get_json()}
+        self.assertEqual(bal, {1: 24, 2: 24, 3: 5})
+
+    def test_repairs_duties_wrongly_marked_by_previous_version(self):
+        eid = self.emp()
+        eid2 = self.emp("Петров Пётр", "Техник")
+        past = (date.today() - timedelta(days=2)).isoformat()
+        db_path = self.app.config["DB_PATH"]
+        with sqlite3.connect(db_path) as conn:  # так прошлая версия помечала все дежурства старой базы
+            conn.execute("INSERT INTO duties (duty_date, employee_id, kind, accrued_at) VALUES (?,?,?,?)",
+                         (past, eid, "unofficial", "до автоначисления"))
+            conn.execute("INSERT INTO duties (duty_date, employee_id, accrued_at) VALUES (?,?,?)",
+                         (past, eid2, "до автоначисления"))
+        c = create_app(db_path).test_client()
+        bal = {b["employee_id"]: (b["official"], b["unofficial"]) for b in c.get("/api/balance").get_json()}
+        self.assertEqual(bal, {eid: (0, 24), eid2: (24, 0)})
 
     # --- остатки часов (таблица balances) ---
     def bal(self, eid):

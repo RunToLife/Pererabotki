@@ -169,7 +169,8 @@ tfoot td { font: 800 13px var(--f-mono); border-top: var(--bd); border-bottom: 0
 .legend { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 16px; border-top: var(--bd); font: 400 12px var(--f-mono); }
 td.nowrap { white-space: nowrap; }
 td.num.pos { color: var(--green-ink); } td.num.neg { color: var(--red-ink); }
-.nums b.neg { color: var(--red-ink); }
+.nums b.neg, td b.neg { color: var(--red-ink); }
+small.planned { display: block; font: 400 10px var(--f-mono); color: var(--muted); white-space: nowrap; }
 
 /* ---------- Аудит ---------- */
 .audit-diff { margin-top: 4px; font: 400 12px var(--f-mono); }
