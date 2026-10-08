@@ -35,14 +35,14 @@ if not defined PY (
   where winget >nul 2>nul
   if errorlevel 1 (
     echo ОШИБКА: winget недоступен. Установите Python 3.8+ с https://www.python.org/downloads/ ^(отметьте "Add python.exe to PATH"^) и запустите скрипт снова.
-    exit /b 1
+    goto :fail
   )
   winget install -e --id Python.Python.3.12 --scope user --accept-package-agreements --accept-source-agreements
   rem PATH в текущем окне не обновился - ищем python в стандартном месте установки
   for %%D in ("%LocalAppData%\Programs\Python\Python312\python.exe") do if exist %%D set "PY=%%~D"
   if not defined PY (
     echo Python установлен, но окно нужно перезапустить. Закройте это окно и запустите install.bat ещё раз.
-    exit /b 1
+    goto :fail
   )
   set "PY="!PY!""
 )
@@ -52,12 +52,12 @@ echo.
 echo ==^> Создание виртуального окружения
 if not exist "venv\Scripts\python.exe" (
   %PY% -m venv venv
-  if errorlevel 1 ( echo ОШИБКА: не удалось создать venv & exit /b 1 )
+  if errorlevel 1 ( echo ОШИБКА: не удалось создать venv & goto :fail )
 )
 echo ==^> Установка зависимостей из vendor\wheels ^(без интернета^)
-if not exist "%ROOT%\vendor\wheels" ( echo ОШИБКА: нет папки vendor\wheels с библиотеками. Скопируйте проект целиком. & exit /b 1 )
+if not exist "%ROOT%\vendor\wheels" ( echo ОШИБКА: нет папки vendor\wheels с библиотеками. Скопируйте проект целиком. & goto :fail )
 "venv\Scripts\python.exe" -m pip install --disable-pip-version-check -q --no-index --find-links "%ROOT%\vendor\wheels" -r requirements.txt
-if errorlevel 1 ( echo ОШИБКА: не удалось установить зависимости & exit /b 1 )
+if errorlevel 1 ( echo ОШИБКА: не удалось установить зависимости & goto :fail )
 if not exist data mkdir data
 
 set "NOSTART="
@@ -89,9 +89,10 @@ set "TRIES=0"
 set /a TRIES+=1
 powershell -NoProfile -Command "try { (Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:%PERER_PORT%/api/me' -TimeoutSec 1).StatusCode } catch { exit 1 }" >nul 2>nul
 if not errorlevel 1 goto ok
-if %TRIES% GEQ 20 (
-  echo ОШИБКА: сервис не ответил за 10 секунд. Смотрите data\server.log
-  exit /b 1
+if %TRIES% GEQ 30 (
+  echo ОШИБКА: сервис не ответил за 30 секунд.
+  echo Чтобы увидеть ошибку запуска, выполните start.bat в этой же папке.
+  goto :fail
 )
 timeout /t 1 /nobreak >nul
 goto wait
@@ -99,7 +100,20 @@ goto wait
 :ok
 echo.
 rem localhost (а не 127.0.0.1) браузеры относят к зоне «Местная интрасеть» и сами передают учётку Windows
-echo Готово! Сервис работает: http://localhost:%PERER_PORT%
+echo Готово. Сервис работает: http://localhost:%PERER_PORT%
 echo Настройки входа по учётной записи Windows/AD: файл settings.env и README.md
 start "" "http://localhost:%PERER_PORT%"
 endlocal
+exit /b 0
+
+:fail
+rem При двойном щелчке окно иначе закроется сразу и текст ошибки не будет виден
+echo.
+if exist "%ROOT%\data\server.log" (
+  echo --- Последние строки data\server.log ---
+  powershell -NoProfile -Command "Get-Content -Tail 20 -Encoding UTF8 -LiteralPath '%ROOT%\data\server.log'"
+)
+echo.
+echo Установка не завершена. Пришлите текст из этого окна разработчику.
+pause
+exit /b 1
