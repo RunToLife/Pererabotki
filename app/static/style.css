@@ -182,6 +182,57 @@ small.planned { display: block; font: 400 10px var(--f-mono); color: var(--muted
 .filters .grow { flex: 1; min-width: 180px; } .filters .grow input { width: 100%; }
 .pager { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-top: var(--bd); font: 400 12px var(--f-mono); }
 
+/* ---------- Аналитика ---------- */
+.split.single { gap: 24px; }
+.presets { display: flex; flex-wrap: wrap; gap: 6px; width: 100%; }
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 16px; }
+.kpi { display: grid; gap: 2px; padding: 14px 16px; background: var(--paper); border: var(--bd); box-shadow: var(--shadow); }
+.kpi b { font: 800 28px/1.1 var(--f-head); font-variant-numeric: tabular-nums; }
+.kpi small { font: 400 11px var(--f-mono); color: var(--muted); }
+.grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; align-items: start; }
+.chart-note { margin: 10px 0 0; font: 400 12px var(--f-mono); }
+th.grp { text-align: center; border-bottom: 1px solid var(--ink); }
+th.we { color: var(--ink); }
+
+/* Тепловая карта «кто × день недели»: одна гамма зелёного, светлее — реже */
+td.heat { text-align: center; font: 700 13px var(--f-mono); min-width: 38px; border-left: 2px solid var(--paper); }
+.heat.h0 { background: transparent; } .heat.h1 { background: #e3f7eb; } .heat.h2 { background: #b4ebc8; }
+.heat.h3 { background: #7be0a4; } .heat.h4 { background: #3fbf74; }
+/* Неофициальные — та же шкала в жёлтом */
+.heat.unofficial.h1 { background: #fff6dc; } .heat.unofficial.h2 { background: #ffe8a3; }
+.heat.unofficial.h3 { background: #ffd25a; } .heat.unofficial.h4 { background: #f0b000; }
+table.whowhen tbody tr:hover td.heat { outline: 2px solid var(--ink); outline-offset: -2px; }
+td.total-cell { min-width: 110px; }
+td.total-cell b { font-size: 14px; }
+.legend .scale { display: inline-flex; gap: 2px; } .legend .scale i { width: 18px; height: 12px; border: 1px solid var(--ink); }
+
+/* Полоса-доля в ячейке */
+.meter { display: block; height: 6px; margin-top: 4px; background: var(--mint-2); border: 1px solid var(--ink); }
+.meter i { display: block; height: 100%; background: var(--ink); }
+
+/* Вертикальные столбики (дни недели, месяцы) */
+.vbars { display: flex; align-items: stretch; gap: 8px; height: 220px; }
+.vbar { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: stretch; gap: 4px; }
+.vbar .val { text-align: center; font: 700 12px var(--f-mono); min-height: 16px; }
+.vbar .track { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; gap: 2px; border-bottom: var(--bd); }
+.vbar .track i { display: block; background: var(--green); border: 2px solid var(--ink); border-bottom: 0; border-radius: 4px 4px 0 0; min-height: 0; }
+.vbar.unofficial .track i { background: var(--amber); }
+.vbar.we .cap { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
+.vbar .cap { text-align: center; font: 700 11px var(--f-mono); text-transform: uppercase; color: var(--muted); line-height: 1.2; }
+.vbar .cap small { display: block; font-weight: 400; font-size: 10px; }
+.vbar.stack .track i { border-radius: 0; }
+.vbar.stack .track i:first-child { border-radius: 4px 4px 0 0; }
+.vbar.stack .track i.official { background: var(--green); }
+.vbar.stack .track i.unofficial { background: var(--amber); }
+.vbar:hover .track i { filter: brightness(.9); }
+.vbars.months { gap: 4px; }
+.vbars.dense .cap { font-size: 9px; } .vbars.dense .val { font-size: 10px; }
+.legend .key { width: 14px; height: 14px; border: 2px solid var(--ink); } .legend .key.official { background: var(--green); } .legend .key.unofficial { background: var(--amber); }
+.card-body:not(.flush) .legend { margin: 12px -16px -16px; }
+.grid2 th, .grid2 td { padding: 10px; }
+
+@media (max-width: 1100px) { .grid2 { grid-template-columns: minmax(0, 1fr); } }
+
 /* ---------- Диалог и уведомления ---------- */
 dialog { width: min(460px, 92vw); padding: 0; background: var(--paper); color: var(--ink); border: var(--bd); box-shadow: 8px 8px 0 var(--ink); }
 dialog::backdrop { background: rgba(10, 10, 10, .45); }

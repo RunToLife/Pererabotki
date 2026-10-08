@@ -12,6 +12,7 @@ const TABS = {
   schedule: ["Раздел 01", "График дежурств"], dayoffs: ["Раздел 02", "График отгулов"],
   official: ["Раздел 03", "Официальные часы"], unofficial: ["Раздел 04", "Неофициальные часы"],
   employees: ["Раздел 05", "Дежурные"], audit: ["Раздел 06", "Журнал аудита"],
+  analytics: ["Раздел 07", "Аналитика и дашборды"],
 };
 const KIND_BADGE = { official: "green", unofficial: "amber" };
 const DUTY_KIND = { official: "Официальное", unofficial: "Неофициальное" };
@@ -529,6 +530,195 @@ async function renderAudit() {
   await loadAudit(false);
 }
 
+// ---------- Аналитика ----------
+const WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
+const WEEKDAYS_FULL = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"];
+const analytics = { from: `${new Date().getFullYear()}-01`, to: currentMonth(), kind: "", preset: "year" };
+
+/** Периоды-пресеты: [подпись, функция → [from, to]]. «Всё время» берёт границы из месяцев с данными. */
+const PRESETS = {
+  month: ["Месяц", () => [currentMonth(), currentMonth()]],
+  quarter: ["3 месяца", () => [shiftMonth(currentMonth(), -2), currentMonth()]],
+  year: ["С начала года", () => [`${new Date().getFullYear()}-01`, currentMonth()]],
+  last12: ["12 месяцев", () => [shiftMonth(currentMonth(), -11), currentMonth()]],
+  all: ["Всё время", async () => {
+    const months = (await api("GET", "/api/months")).sort();
+    return [months[0], months[months.length - 1]];
+  }],
+};
+
+/** «1 официальное дежурство», «3 неофициальных дежурства». */
+function dutyCount(n, kind) {
+  const adj = kind === "official" ? "официальн" : "неофициальн";
+  return `${n} ${adj}${plural(n, ["ое", "ых", "ых"])} ${plural(n, ["дежурство", "дежурства", "дежурств"])}`;
+}
+
+/** Ступень заливки тепловой карты: 0 — пусто, 4 — максимум периода. */
+function heatLevel(n, max) { return !n ? 0 : Math.min(4, Math.ceil((n / max) * 4)); }
+
+function periodTitle(from, to) {
+  return from === to ? monthTitle(from) : `${monthTitle(from)} — ${monthTitle(to)}`;
+}
+
+function kpi(label, value, sub = "") {
+  return `<div class="kpi"><span class="label">${esc(label)}</span><b>${value}</b>${sub ? `<small>${sub}</small>` : ""}</div>`;
+}
+
+/** Горизонтальная полоса-доля: value из max. */
+function meter(value, max, cls = "") {
+  const w = max > 0 ? Math.max(value > 0 ? 2 : 0, (value / max) * 100) : 0;
+  return `<span class="meter ${cls}"><i style="width:${w.toFixed(1)}%"></i></span>`;
+}
+
+/** Таблица «кто × день недели» для одного типа дежурства (official / unofficial). */
+function whoWhenTable(people, kind) {
+  const rows = people.map((p) => ({ ...p, k: p.by_kind[kind] })).filter((p) => p.k.duties)
+    .sort((a, b) => b.k.duties - a.k.duties || a.full_name.localeCompare(b.full_name, "ru"));
+  if (!rows.length) return '<div class="empty">За выбранный период таких дежурств нет.</div>';
+  const maxCell = Math.max(1, ...rows.flatMap((p) => p.k.weekday));
+  const maxTotal = Math.max(...rows.map((p) => p.k.duties));
+  const body = rows.map((p) => {
+    const cells = p.k.weekday.map((n, i) => `<td class="heat ${kind} h${heatLevel(n, maxCell)}"
+      title="${esc(`${p.full_name}: ${WEEKDAYS_FULL[i]} — ${dutyCount(n, kind)}`)}">${n || ""}</td>`).join("");
+    const top = Math.max(...p.k.weekday);
+    const fav = p.k.weekday.map((n, i) => (n === top ? WEEKDAYS[i] : null)).filter(Boolean).join(", ");
+    return `<tr><td>${esc(p.full_name)}<span class="sub">${esc(p.position)}${p.active ? "" : " · удалён"}</span></td>${cells}
+      <td class="num total-cell"><b>${p.k.duties}</b>${meter(p.k.duties, maxTotal)}
+        ${p.k.planned ? `<small class="planned">из них ${p.k.planned} впереди</small>` : ""}</td>
+      <td class="num">${fmtNum(p.k.hours)}</td><td class="mono">${esc(fav)}</td></tr>`;
+  }).join("");
+  const byDay = WEEKDAYS.map((_, i) => rows.reduce((s, p) => s + p.k.weekday[i], 0));
+  const sum = byDay.reduce((a, b) => a + b, 0);
+  const hours = rows.reduce((s, p) => s + p.k.hours, 0);
+  return `<div class="table-wrap"><table class="whowhen"><thead><tr><th>Дежурный</th>
+      ${WEEKDAYS.map((d, i) => `<th class="num ${i >= 5 ? "we" : ""}">${d}</th>`).join("")}
+      <th class="num">Всего</th><th class="num">Часов</th><th>Чаще всего</th></tr></thead>
+    <tbody>${body}</tbody>
+    <tfoot><tr><td>Итого</td>${byDay.map((n) => `<td class="num">${n}</td>`).join("")}<td class="num">${sum}</td>
+      <td class="num">${fmtNum(hours)}</td><td></td></tr></tfoot></table></div>
+    <div class="legend"><span>Чем темнее клетка, тем чаще человек дежурил в этот день недели</span>
+      <span class="scale">${[1, 2, 3, 4].map((l) => `<i class="heat ${kind} h${l}"></i>`).join("")}</span></div>`;
+}
+
+/** Столбики Пн–Вс для одного типа дежурства. max — общий масштаб, чтобы два графика можно было сравнивать на глаз. */
+function weekdayChart(weekday, kind, max) {
+  const total = weekday.reduce((a, b) => a + b, 0);
+  if (!total) return '<div class="empty">За период таких дежурств нет.</div>';
+  const bars = weekday.map((n, i) => {
+    const share = Math.round((n / total) * 100);
+    return `<div class="vbar ${kind} ${i >= 5 ? "we" : ""}" title="${esc(`${WEEKDAYS_FULL[i]}: ${dutyCount(n, kind)} (${share}%)`)}">
+      <span class="val">${n}</span><div class="track">${n ? `<i style="height:${((n / max) * 100).toFixed(1)}%"></i>` : ""}</div><span class="cap">${WEEKDAYS[i]}</span></div>`;
+  }).join("");
+  const weekend = weekday[5] + weekday[6];
+  return `<div class="vbars">${bars}</div>
+    <p class="muted chart-note">Всего ${total} · в выходные ${weekend} (${Math.round((weekend / total) * 100)}%)</p>`;
+}
+
+function monthChart(months) {
+  const max = Math.max(...months.map((m) => m.official + m.unofficial));
+  if (!max) return '<div class="empty">Нет данных.</div>';
+  const bars = months.map((m) => {
+    const n = m.official + m.unofficial;
+    const [y, mo] = m.month.split("-").map(Number);
+    const tip = `${monthTitle(m.month)}: ${n} ${plural(n, ["дежурство", "дежурства", "дежурств"])} — офиц. ${m.official}, неофиц. ${m.unofficial}; ${fmtNum(m.hours)} ч`;
+    return `<div class="vbar stack" title="${esc(tip)}"><span class="val">${n || ""}</span>
+      <div class="track">${["unofficial", "official"].filter((k) => m[k]).map((k) => `<i class="${k}" style="height:${((m[k] / max) * 100).toFixed(1)}%"></i>`).join("")}</div>
+      <span class="cap">${MONTH_NAMES[mo - 1].slice(0, 3)}${months.length > 12 || mo === 1 ? `<small>${String(y).slice(2)}</small>` : ""}</span></div>`;
+  }).join("");
+  return `<div class="vbars months ${months.length > 18 ? "dense" : ""}">${bars}</div>
+    <div class="legend"><span class="key official"></span><span>Официальные</span><span class="key unofficial"></span><span>Неофициальные</span></div>`;
+}
+
+function hoursByTypeTable(t) {
+  const row = (kind) => {
+    const s = t[kind];
+    const net = s.duty + s.manual + s.dayoff;
+    return `<tr><td>${badge(HOURS_KIND[kind], KIND_BADGE[kind])}</td><td class="num pos">${fmtSigned(s.duty)}</td>
+      <td class="num pos">${fmtSigned(s.manual)}</td><td class="num neg">${fmtSigned(s.dayoff)}</td><td class="num"><b>${fmtNum(net)}</b></td></tr>`;
+  };
+  return `<div class="table-wrap"><table><thead><tr><th>Таблица</th><th class="num">За дежурства</th><th class="num">Вручную</th>
+    <th class="num">Отгулы</th><th class="num">Итого</th></tr></thead><tbody>${row("official")}${row("unofficial")}</tbody></table></div>`;
+}
+
+function rolesTable(roles) {
+  if (!roles.length) return '<div class="empty">Нет данных.</div>';
+  const max = Math.max(...roles.map((r) => r.duties));
+  return `<div class="table-wrap"><table><thead><tr><th>Роль</th><th class="num">Дежурств</th><th class="num">Офиц. ч</th><th class="num">Неофиц. ч</th></tr></thead>
+    <tbody>${roles.map((r) => `<tr><td>${esc(r.label)}</td><td class="num">${r.duties}${meter(r.duties, max)}</td>
+      <td class="num">${fmtNum(r.official_hours)}</td><td class="num">${fmtNum(r.unofficial_hours)}</td></tr>`).join("")}</tbody></table></div>`;
+}
+
+function hoursByPersonTable(people) {
+  const rows = people.filter((p) => p.accrued_official || p.accrued_unofficial || p.deducted_official || p.deducted_unofficial);
+  if (!rows.length) return '<div class="empty">За выбранный период часов нет.</div>';
+  const net = (n) => `<b class="${n < 0 ? "neg" : ""}">${fmtNum(n)}</b>`;
+  const body = rows.sort((a, b) => (b.net_official + b.net_unofficial) - (a.net_official + a.net_unofficial)
+      || a.full_name.localeCompare(b.full_name, "ru"))
+    .map((p) => `<tr><td>${esc(p.full_name)}<span class="sub">${esc(p.position)}</span></td>
+      <td class="num pos">${fmtSigned(p.accrued_official)}</td><td class="num neg">${fmtSigned(-p.deducted_official)}</td><td class="num">${net(p.net_official)}</td>
+      <td class="num pos">${fmtSigned(p.accrued_unofficial)}</td><td class="num neg">${fmtSigned(-p.deducted_unofficial)}</td><td class="num">${net(p.net_unofficial)}</td>
+      <td class="num">${p.dayoffs}</td></tr>`).join("");
+  return `<div class="table-wrap"><table><thead>
+      <tr><th rowspan="2">Сотрудник</th><th colspan="3" class="grp">Официальные часы</th><th colspan="3" class="grp">Неофициальные часы</th><th rowspan="2" class="num">Отгулов</th></tr>
+      <tr><th class="num">Начислено</th><th class="num">Списано</th><th class="num">Итого</th><th class="num">Начислено</th><th class="num">Списано</th><th class="num">Итого</th></tr></thead>
+    <tbody>${body}</tbody></table></div>`;
+}
+
+async function renderAnalytics(seq) {
+  const params = new URLSearchParams({ from: analytics.from, to: analytics.to });
+  if (analytics.kind) params.set("kind", analytics.kind);
+  const data = await api("GET", `/api/analytics?${params}`);
+  if (isStale(seq)) return;
+  const t = data.totals;
+  const presetBtns = Object.entries(PRESETS).map(([k, [label]]) =>
+    `<button type="button" class="btn sm ${analytics.preset === k ? "approve" : ""}" data-preset="${k}">${esc(label)}</button>`).join("");
+  const accrued = (k) => t[k].duty + t[k].manual;
+  const weekdayMax = Math.max(1, ...data.weekday_by_kind.official, ...data.weekday_by_kind.unofficial);
+
+  view.innerHTML = `<div class="split single">
+    ${card("Период", `<form id="anform" class="filters">
+      <div class="presets">${presetBtns}</div>
+      <label><span>С месяца</span><input type="month" name="from" value="${analytics.from}" required></label>
+      <label><span>По месяц</span><input type="month" name="to" value="${analytics.to}" required></label>
+      <label><span>Тип дежурства</span><select name="kind"><option value="">Все</option>${options(DUTY_KIND, analytics.kind)}</select></label>
+      <button class="btn approve" type="submit">Показать</button></form>`, { right: badge(periodTitle(data.from, data.to), "", true) })}
+    <div class="kpis">
+      ${kpi("Дежурств", t.duties, t.planned ? `из них ${t.planned} впереди` : "по графику за период")}
+      ${kpi("Дежурили", t.people, plural(t.people, ["человек", "человека", "человек"]))}
+      ${kpi("Часов по графику", fmtNum(t.duty_hours), "сумма часов дежурств")}
+      ${kpi("Официальные часы", fmtNum(accrued("official") + t.official.dayoff), `+${fmtNum(accrued("official"))} / −${fmtNum(Math.abs(t.official.dayoff))} за отгулы`)}
+      ${kpi("Неофициальные часы", fmtNum(accrued("unofficial") + t.unofficial.dayoff), `+${fmtNum(accrued("unofficial"))} / −${fmtNum(Math.abs(t.unofficial.dayoff))} за отгулы`)}
+    </div>
+    ${[["official", "Официальные"], ["unofficial", "Неофициальные"]].map(([k, name]) =>
+      card(`${name} дежурства: кто, сколько раз и в какие дни недели`, whoWhenTable(data.people, k),
+        { flush: true, right: badge(name, KIND_BADGE[k]) })).join("")}
+    <div class="grid2">
+      ${[["official", "Официальные"], ["unofficial", "Неофициальные"]].map(([k, name]) => card(`${name} дежурства по дням недели`,
+        weekdayChart(data.weekday_by_kind[k], k, weekdayMax))).join("")}
+    </div>
+    ${card("Дежурства по месяцам", monthChart(data.months))}
+    <div class="grid2">
+      ${card("Часы по таблицам", hoursByTypeTable(t) + '<p class="muted chart-note" style="padding:0 16px 12px">Все записи часов за период, включая ручные. Фильтр по типу дежурства на эту таблицу не влияет.</p>', { flush: true })}
+      ${card("Дежурства по ролям", rolesTable(data.roles), { flush: true })}
+    </div>
+    ${card("Часы по сотрудникам", hoursByPersonTable(data.people), { flush: true })}
+  </div>`;
+
+  const form = $("#anform");
+  form.onsubmit = (e) => {
+    e.preventDefault();
+    const d = Object.fromEntries(new FormData(form));
+    Object.assign(analytics, { from: d.from, to: d.to, kind: d.kind, preset: "" });
+    render();
+  };
+  form.elements.kind.onchange = () => form.requestSubmit();
+  view.querySelectorAll("[data-preset]").forEach((btn) => (btn.onclick = () => guarded(async () => {
+    const [from, to] = await PRESETS[btn.dataset.preset][1]();
+    Object.assign(analytics, { from, to, preset: btn.dataset.preset });
+    await render();
+  })));
+}
+
 // ---------- Каркас ----------
 async function refreshHistory() {
   const months = await api("GET", "/api/months");
@@ -561,6 +751,7 @@ async function render() {
     else if (state.tab === "dayoffs") await renderDayoffs(seq);
     else if (state.tab === "employees") await renderEmployees();
     else if (state.tab === "audit") await renderAudit();
+    else if (state.tab === "analytics") await renderAnalytics(seq);
     else await renderHours(state.tab, seq);
   });
 }
