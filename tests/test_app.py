@@ -7,7 +7,24 @@ from datetime import date, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from app import winauth  # noqa: E402
 from app.server import create_app  # noqa: E402
+
+
+class FakeAuthenticator:
+    """Имитирует двухшаговое рукопожатие NTLM без Windows."""
+
+    def __init__(self):
+        self.pending = set()
+
+    def step(self, key, scheme, token):
+        if token == b"type1":
+            self.pending.add(key)
+            return winauth.AuthResult(b"challenge")
+        if token == b"type3" and key in self.pending:
+            self.pending.discard(key)
+            return winauth.AuthResult(user="CORP\\ivanov")
+        return winauth.AuthResult(failed=True)
 
 
 class AppTest(unittest.TestCase):
@@ -284,3 +301,73 @@ class AppTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WindowsAuthTest(unittest.TestCase):
+    def make(self, mode="auto", allow_manual=None):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        if allow_manual is not None:
+            os.environ["PERER_ALLOW_MANUAL"] = allow_manual
+            self.addCleanup(os.environ.pop, "PERER_ALLOW_MANUAL", None)
+        app = create_app(os.path.join(self.tmp.name, "t.db"), auth_mode=mode,
+                         authenticator=FakeAuthenticator())
+        return app.test_client()
+
+    def neg(self, c, token, port="5000"):
+        import base64
+        return c.get("/api/login/windows", environ_overrides={
+            "REMOTE_ADDR": "10.0.0.7", "REMOTE_PORT": port},
+            headers={"Authorization": "NTLM " + base64.b64encode(token).decode()})
+
+    def test_handshake_sets_session(self):
+        c = self.make()
+        r = c.get("/api/login/windows", environ_overrides={"REMOTE_ADDR": "10.0.0.7"})
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.headers.getlist("WWW-Authenticate"), ["NTLM"])
+        r = self.neg(c, b"type1")
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.headers["WWW-Authenticate"], "NTLM Y2hhbGxlbmdl")
+        r = self.neg(c, b"type3")
+        self.assertEqual(r.status_code, 200, r.get_json())
+        me = c.get("/api/me", environ_overrides={"REMOTE_ADDR": "10.0.0.7"}).get_json()
+        self.assertEqual((me["login"], me["source"]), ("CORP\\ivanov", "windows"))
+        c.post("/api/employees", json={"full_name": "Петров П.П.", "position": "Инженер"},
+               environ_overrides={"REMOTE_ADDR": "10.0.0.7"})
+        audit = c.get("/api/audit").get_json()["items"][0]
+        self.assertEqual(audit["actor"], "CORP\\ivanov")
+
+    def test_handshake_other_connection_fails(self):
+        c = self.make()
+        self.neg(c, b"type1", port="5000")
+        self.assertEqual(self.neg(c, b"type3", port="5001").status_code, 403)
+
+    def test_logout(self):
+        c = self.make()
+        self.neg(c, b"type1")
+        self.neg(c, b"type3")
+        c.post("/api/logout", environ_overrides={"REMOTE_ADDR": "10.0.0.7"})
+        me = c.get("/api/me", environ_overrides={"REMOTE_ADDR": "10.0.0.7"}).get_json()
+        self.assertEqual(me["source"], "unknown")
+        self.assertTrue(me["windows_auth"])
+
+    def test_windows_mode_blocks_manual_and_localhost_os_user(self):
+        c = self.make("windows")
+        local = {"REMOTE_ADDR": "127.0.0.1"}
+        me = c.get("/api/me", environ_overrides=local).get_json()
+        self.assertEqual(me["source"], "unknown")
+        self.assertFalse(me["allow_manual"])
+        self.assertEqual(c.post("/api/me", json={"name": "x"}).status_code, 403)
+        r = c.post("/api/employees", json={"full_name": "А", "position": "Б"}, environ_overrides=local)
+        self.assertEqual(r.status_code, 401)
+
+    def test_off_mode_has_no_windows_login(self):
+        c = self.make("off")
+        self.assertFalse(c.get("/api/me").get_json()["windows_auth"])
+        self.assertEqual(c.get("/api/login/windows").status_code, 404)
+
+    def test_initial_token_detection(self):
+        self.assertTrue(winauth.is_initial_token(b"\x60\x82rest"))
+        self.assertTrue(winauth.is_initial_token(b"NTLMSSP\x00\x01\x00\x00\x00..."))
+        self.assertFalse(winauth.is_initial_token(b"NTLMSSP\x00\x03\x00\x00\x00..."))
+        self.assertFalse(winauth.is_initial_token(b"\xa1\x81"))
