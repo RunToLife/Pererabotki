@@ -4,7 +4,8 @@ rem   install.bat                 установить и запустить (а
 rem   install.bat --no-start      только установить зависимости, не запускать (--no-autostart - то же самое)
 rem   set PERER_PORT=9000 ^& install.bat   другой порт (по умолчанию 8080)
 chcp 65001 >nul
-setlocal EnableDelayedExpansion
+rem Отложенное раскрытие (!) не включаем: путь к папке может содержать "!"
+setlocal
 cd /d "%~dp0"
 set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
@@ -13,12 +14,13 @@ if not defined PERER_HOST set "PERER_HOST=127.0.0.1"
 
 echo.
 echo ==^> Проверка Python
+rem PY - полный путь к python.exe без кавычек; везде используется как "%PY%".
+rem Кавычки внутри значения ломали скрипт, если в пути к папке есть скобки, например "Загрузки\Pererabotki-main (1)".
 set "PY="
-where py >nul 2>nul && (py -3 -c "import sys; sys.exit(0 if sys.version_info>=(3,8) else 1)" >nul 2>nul && set "PY=py -3")
-if not defined PY (
-  where python >nul 2>nul && (python -c "import sys; sys.exit(0 if sys.version_info>=(3,8) else 1)" >nul 2>nul && set "PY=python")
-)
-if not defined PY if exist "%ROOT%\runtime\python\python.exe" set "PY="%ROOT%\runtime\python\python.exe""
+for /f "delims=" %%P in ('py -3 -c "import sys; assert sys.hexversion >= 0x3080000; print(sys.executable)" 2^>nul') do set "PY=%%P"
+if not defined PY for /f "delims=" %%P in ('python -c "import sys; assert sys.hexversion >= 0x3080000; print(sys.executable)" 2^>nul') do set "PY=%%P"
+if defined PY if not exist "%PY%" set "PY="
+if not defined PY if exist "%ROOT%\runtime\python\python.exe" set "PY=%ROOT%\runtime\python\python.exe"
 if not defined PY if exist "%ROOT%\vendor\python\python-3.12.10-win-amd64.zip" (
   echo Python 3.8+ не найден. Распаковываю встроенный Python 3.12 из vendor\python ^(без интернета^)...
   if exist "%ROOT%\runtime\_unpack" rmdir /s /q "%ROOT%\runtime\_unpack"
@@ -28,7 +30,7 @@ if not defined PY if exist "%ROOT%\vendor\python\python-3.12.10-win-amd64.zip" (
     move "%ROOT%\runtime\_unpack\tools" "%ROOT%\runtime\python" >nul
     rmdir /s /q "%ROOT%\runtime\_unpack"
   )
-  if exist "%ROOT%\runtime\python\python.exe" set "PY="%ROOT%\runtime\python\python.exe""
+  if exist "%ROOT%\runtime\python\python.exe" set "PY=%ROOT%\runtime\python\python.exe"
 )
 if not defined PY (
   echo Python 3.8+ не найден и встроенный Python недоступен. Пробую установить через winget ^(нужен интернет^)...
@@ -44,14 +46,13 @@ if not defined PY (
     echo Python установлен, но окно нужно перезапустить. Закройте это окно и запустите install.bat ещё раз.
     goto :fail
   )
-  set "PY="!PY!""
 )
-%PY% --version
+"%PY%" --version
 
 echo.
 echo ==^> Создание виртуального окружения
 if not exist "venv\Scripts\python.exe" (
-  %PY% -m venv venv
+  "%PY%" -m venv venv
   if errorlevel 1 ( echo ОШИБКА: не удалось создать venv & goto :fail )
 )
 echo ==^> Установка зависимостей из vendor\wheels ^(без интернета^)
