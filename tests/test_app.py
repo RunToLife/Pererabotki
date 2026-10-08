@@ -379,6 +379,11 @@ class AppTest(unittest.TestCase):
         self.assertEqual(pa["weekday"], expected)
         self.assertEqual(pb["weekday"][date(2026, 9, 8).weekday()], 1)
         self.assertEqual(r["weekday"][0], 3)
+        self.assertEqual(r["weekday_by_kind"]["official"], expected)
+        self.assertEqual(pa["by_kind"]["official"]["weekday"], expected)
+        self.assertEqual((pa["by_kind"]["unofficial"]["duties"], pb["by_kind"]["unofficial"]["hours"]), (0, 8))
+        self.assertEqual(sum(r["weekday_by_kind"]["unofficial"]), 1)
+        self.assertEqual(r["weekday_by_kind"]["unofficial"][date(2026, 9, 8).weekday()], 1)
         self.assertEqual((pa["accrued_official"], pa["deducted_official"], pa["net_official"], pa["dayoffs"]),
                          (96, 8, 88, 1))
         self.assertEqual((pb["accrued_unofficial"], pb["accrued_official"], pb["unofficial_duties"]), (8, 2, 1))

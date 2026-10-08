@@ -198,6 +198,9 @@ th.we { color: var(--ink); }
 td.heat { text-align: center; font: 700 13px var(--f-mono); min-width: 38px; border-left: 2px solid var(--paper); }
 .heat.h0 { background: transparent; } .heat.h1 { background: #e3f7eb; } .heat.h2 { background: #b4ebc8; }
 .heat.h3 { background: #7be0a4; } .heat.h4 { background: #3fbf74; }
+/* Неофициальные — та же шкала в жёлтом */
+.heat.unofficial.h1 { background: #fff6dc; } .heat.unofficial.h2 { background: #ffe8a3; }
+.heat.unofficial.h3 { background: #ffd25a; } .heat.unofficial.h4 { background: #f0b000; }
 table.whowhen tbody tr:hover td.heat { outline: 2px solid var(--ink); outline-offset: -2px; }
 td.total-cell { min-width: 110px; }
 td.total-cell b { font-size: 14px; }
@@ -213,7 +216,8 @@ td.total-cell b { font-size: 14px; }
 .vbar .val { text-align: center; font: 700 12px var(--f-mono); min-height: 16px; }
 .vbar .track { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; gap: 2px; border-bottom: var(--bd); }
 .vbar .track i { display: block; background: var(--green); border: 2px solid var(--ink); border-bottom: 0; border-radius: 4px 4px 0 0; min-height: 0; }
-.vbar.we .track i { background: var(--amber); }
+.vbar.unofficial .track i { background: var(--amber); }
+.vbar.we .cap { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
 .vbar .cap { text-align: center; font: 700 11px var(--f-mono); text-transform: uppercase; color: var(--muted); line-height: 1.2; }
 .vbar .cap small { display: block; font-weight: 400; font-size: 10px; }
 .vbar.stack .track i { border-radius: 0; }

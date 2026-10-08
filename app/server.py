@@ -1031,6 +1031,7 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
         ).fetchall()
 
         people, weekday, by_month, by_role = {}, [0] * 7, {}, {}
+        weekday_by_kind = {k: [0] * 7 for k in DUTY_KIND_LABEL}
 
         def person(r):
             return people.setdefault(r["employee_id"], {
@@ -1039,6 +1040,7 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
                 "duty_hours": 0.0, "official_duties": 0, "unofficial_duties": 0, "roles": {},
                 "accrued_official": 0.0, "accrued_unofficial": 0.0,
                 "deducted_official": 0.0, "deducted_unofficial": 0.0, "dayoffs": 0,
+                "by_kind": {k: {"duties": 0, "planned": 0, "weekday": [0] * 7, "hours": 0.0} for k in DUTY_KIND_LABEL},
             })
 
         for r in duties:
@@ -1049,7 +1051,13 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
             p["duty_hours"] += r["hours"]
             p[f"{r['kind']}_duties"] += 1
             p["roles"][r["role"]] = p["roles"].get(r["role"], 0) + 1
+            pk = p["by_kind"][r["kind"]]
+            pk["duties"] += 1
+            pk["planned"] += r["duty_date"] > today
+            pk["weekday"][r["dow"]] += 1
+            pk["hours"] += r["hours"]
             weekday[r["dow"]] += 1
+            weekday_by_kind[r["kind"]][r["dow"]] += 1
             m = by_month.setdefault(r["duty_date"][:7], {"official": 0, "unofficial": 0, "hours": 0.0})
             m[r["kind"]] += 1
             m["hours"] += r["hours"]
@@ -1085,6 +1093,8 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
         for p in persons:
             for key in ("duty_hours", "accrued_official", "accrued_unofficial", "deducted_official", "deducted_unofficial"):
                 p[key] = round(p[key], 2)
+            for pk in p["by_kind"].values():
+                pk["hours"] = round(pk["hours"], 2)
             p["net_official"] = round(p["accrued_official"] - p["deducted_official"], 2)
             p["net_unofficial"] = round(p["accrued_unofficial"] - p["deducted_unofficial"], 2)
 
@@ -1107,6 +1117,7 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
                 "unofficial": {k: round(v, 2) for k, v in sources["unofficial"].items()},
             },
             "weekday": weekday,
+            "weekday_by_kind": weekday_by_kind,
             "months": months_list,
             "roles": sorted(({**r, "official_hours": round(r["official_hours"], 2),
                               "unofficial_hours": round(r["unofficial_hours"], 2)} for r in by_role.values()),
