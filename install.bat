@@ -96,6 +96,8 @@ goto wait
 
 :ok
 echo.
-echo Готово! Сервис работает: http://127.0.0.1:%PERER_PORT%
-start "" "http://127.0.0.1:%PERER_PORT%"
+rem localhost (а не 127.0.0.1) браузеры относят к зоне «Местная интрасеть» и сами передают учётку Windows
+echo Готово! Сервис работает: http://localhost:%PERER_PORT%
+echo Настройки входа по учётной записи Windows/AD: файл settings.env и README.md
+start "" "http://localhost:%PERER_PORT%"
 endlocal
