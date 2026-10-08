@@ -160,6 +160,16 @@ tfoot td { font: 800 13px var(--f-mono); border-top: var(--bd); border-bottom: 0
 .chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chip button { padding: 0 2px; cursor: pointer; background: none; border: 0; font-weight: 700; }
 .chip button:hover { color: var(--red-ink); }
+.chip.unofficial { background: var(--amber); }
+.chip.off { background: var(--paper); border-style: dashed; }
+.chip .edit { flex: 1; min-width: 0; padding: 0; text-align: left; font: inherit; overflow: hidden; overflow-wrap: anywhere; }
+.chip .edit small { display: block; font-weight: 400; }
+.chip .edit:hover { color: inherit; text-decoration: underline; }
+.chip .ok { color: var(--green-ink); }
+.legend { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 16px; border-top: var(--bd); font: 400 12px var(--f-mono); }
+td.nowrap { white-space: nowrap; }
+td.num.pos { color: var(--green-ink); } td.num.neg { color: var(--red-ink); }
+.nums b.neg { color: var(--red-ink); }
 
 /* ---------- Аудит ---------- */
 .audit-diff { margin-top: 4px; font: 400 12px var(--f-mono); }
@@ -194,7 +204,8 @@ dialog .actions { display: flex; justify-content: flex-end; gap: 10px; margin-to
   .user { margin-top: 0; }
   .content { padding: 16px 14px 40px; }
   h1 { font-size: 24px; }
-  .day { min-height: 68px; padding: 4px; } .chip { font-size: 10px; }
+  .day { min-height: 68px; padding: 4px; } .chip { font-size: 10px; padding: 1px 2px; }
+  .chip .edit { white-space: nowrap; text-overflow: ellipsis; overflow-wrap: normal; } .chip .edit small { display: none; }
   .calendar { gap: 4px; }
 }
 @media (prefers-reduced-motion: reduce) { .btn { transition: none; } }
