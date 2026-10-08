@@ -356,6 +356,43 @@ class AppTest(unittest.TestCase):
         self.c.delete(f"/api/hours/official/{hid}")
         self.assertEqual(self.bal(eid), (0, 2.5))
 
+    def test_analytics_who_how_often_which_weekday(self):
+        a, b = self.emp("Андреев А. А."), self.emp("Борисов Б. Б.", "Техник")
+        days = ["2026-08-03", "2026-08-10", "2026-08-15", "2026-09-07"]  # Пн, Пн, Сб, Пн
+        for d in days:
+            self.c.post("/api/duties", json={"date": d, "employee_id": a})
+        self.c.post("/api/duties", json={"date": "2026-09-08", "employee_id": b, "kind": "unofficial",
+                                         "role": "assistant", "hours": 8})
+        self.c.post("/api/dayoffs", json={"date": "2026-09-20", "employee_id": a, "hours": 8})
+        self.c.post("/api/hours/official", json={"date": "2026-09-21", "employee_id": b, "hours": 2})
+        self.c.post("/api/duties", json={"date": "2026-10-01", "employee_id": a})  # вне периода
+
+        r = self.c.get("/api/analytics?from=2026-08&to=2026-09").get_json()
+        self.assertEqual((r["totals"]["duties"], r["totals"]["people"], r["totals"]["duty_hours"]), (5, 2, 104))
+        people = {p["full_name"]: p for p in r["people"]}
+        pa, pb = people["Андреев А. А."], people["Борисов Б. Б."]
+        self.assertEqual(r["people"][0]["full_name"], "Андреев А. А.")  # чаще всех — первым
+        self.assertEqual(pa["duties"], 4)
+        expected = [0] * 7
+        for d in days:
+            expected[date.fromisoformat(d).weekday()] += 1
+        self.assertEqual(pa["weekday"], expected)
+        self.assertEqual(pb["weekday"][date(2026, 9, 8).weekday()], 1)
+        self.assertEqual(r["weekday"][0], 3)
+        self.assertEqual((pa["accrued_official"], pa["deducted_official"], pa["net_official"], pa["dayoffs"]),
+                         (96, 8, 88, 1))
+        self.assertEqual((pb["accrued_unofficial"], pb["accrued_official"], pb["unofficial_duties"]), (8, 2, 1))
+        self.assertEqual(r["totals"]["official"], {"duty": 96, "manual": 2, "dayoff": -8})
+        self.assertEqual([m["month"] for m in r["months"]], ["2026-08", "2026-09"])
+        self.assertEqual((r["months"][0]["official"], r["months"][1]["unofficial"]), (3, 1))
+        self.assertEqual({x["role"]: x["duties"] for x in r["roles"]}, {"duty": 4, "assistant": 1})
+
+        only = self.c.get("/api/analytics?from=2026-09&to=2026-08&kind=unofficial").get_json()
+        self.assertEqual((only["from"], only["to"]), ("2026-08", "2026-09"))
+        self.assertEqual([p["full_name"] for p in only["people"]], ["Борисов Б. Б."])
+        self.assertEqual(self.c.get("/api/analytics?from=2026-13").status_code, 400)
+        self.assertEqual(self.c.get("/api/analytics?from=2026-01&kind=x").status_code, 400)
+
     def test_balances_recomputed_on_start(self):
         eid = self.emp()
         self.c.post("/api/hours/official", json={"date": "2026-09-01", "employee_id": eid, "hours": 4})

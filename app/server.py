@@ -1002,6 +1002,118 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
         db().commit()
         return jsonify({"ok": True})
 
+    # ---------- Аналитика ----------
+    @app.get("/api/analytics")
+    def analytics():
+        """Сводка за период месяцев [from, to]: кто, сколько раз и в какие дни недели дежурил, часы по типам и ролям.
+
+        Дежурства считаются все, что стоят в графике за период; «впереди» — ещё не наступившие (дата позже сегодня).
+        Часы берутся из таблицы hours: начислено (дежурства + ручные записи) и списано (отгулы).
+        """
+        start = parse_month(request.args.get("from"))
+        end = parse_month(request.args.get("to") or start)
+        if start > end:
+            start, end = end, start
+        if int(end[:4]) - int(start[:4]) > 50:
+            raise ApiError("Период слишком длинный: не более 50 лет")
+        kind = parse_choice(request.args.get("kind"), DUTY_KIND_LABEL, "Тип дежурства", "")
+        today = date.today().isoformat()
+        duty_where = "substr(d.duty_date,1,7) BETWEEN ? AND ?" + (" AND d.kind=?" if kind else "")
+        duty_params = [start, end] + ([kind] if kind else [])
+
+        # strftime('%w'): 0 — воскресенье; переводим в неделю с понедельника (0 — Пн, 6 — Вс)
+        duties = db().execute(
+            "SELECT d.employee_id, d.kind, d.role, d.hours, d.duty_date,"
+            " (CAST(strftime('%w', d.duty_date) AS INTEGER) + 6) % 7 AS dow,"
+            " e.full_name, e.position, e.active"
+            " FROM duties d JOIN employees e ON e.id=d.employee_id WHERE " + duty_where,
+            duty_params,
+        ).fetchall()
+
+        people, weekday, by_month, by_role = {}, [0] * 7, {}, {}
+
+        def person(r):
+            return people.setdefault(r["employee_id"], {
+                "employee_id": r["employee_id"], "full_name": r["full_name"], "position": r["position"],
+                "active": bool(r["active"]), "duties": 0, "planned": 0, "weekday": [0] * 7,
+                "duty_hours": 0.0, "official_duties": 0, "unofficial_duties": 0, "roles": {},
+                "accrued_official": 0.0, "accrued_unofficial": 0.0,
+                "deducted_official": 0.0, "deducted_unofficial": 0.0, "dayoffs": 0,
+            })
+
+        for r in duties:
+            p = person(r)
+            p["duties"] += 1
+            p["planned"] += r["duty_date"] > today
+            p["weekday"][r["dow"]] += 1
+            p["duty_hours"] += r["hours"]
+            p[f"{r['kind']}_duties"] += 1
+            p["roles"][r["role"]] = p["roles"].get(r["role"], 0) + 1
+            weekday[r["dow"]] += 1
+            m = by_month.setdefault(r["duty_date"][:7], {"official": 0, "unofficial": 0, "hours": 0.0})
+            m[r["kind"]] += 1
+            m["hours"] += r["hours"]
+            role = by_role.setdefault(r["role"], {"role": r["role"], "label": ROLE_LABEL.get(r["role"], r["role"]),
+                                                  "duties": 0, "official_hours": 0.0, "unofficial_hours": 0.0})
+            role["duties"] += 1
+            role[f"{r['kind']}_hours"] += r["hours"]
+
+        hours = db().execute(
+            "SELECT h.employee_id, h.kind, h.source, SUM(h.hours) AS total, COUNT(*) AS n,"
+            " e.full_name, e.position, e.active"
+            " FROM hours h JOIN employees e ON e.id=h.employee_id"
+            " WHERE substr(h.work_date,1,7) BETWEEN ? AND ? GROUP BY h.employee_id, h.kind, h.source",
+            (start, end),
+        ).fetchall()
+        sources = {k: {"duty": 0.0, "manual": 0.0, "dayoff": 0.0} for k in KIND_LABEL}
+        for r in hours:
+            sources[r["kind"]][r["source"]] = round(sources[r["kind"]].get(r["source"], 0) + r["total"], 2)
+            if kind:  # при фильтре по типу дежурства часы показываем только по людям, которые в него попали
+                if r["employee_id"] not in people:
+                    continue
+                p = people[r["employee_id"]]
+            else:
+                p = person(r)
+            if r["total"] < 0:
+                p[f"deducted_{r['kind']}"] += -r["total"]
+            else:
+                p[f"accrued_{r['kind']}"] += r["total"]
+            if r["source"] == "dayoff":
+                p["dayoffs"] += r["n"]
+
+        persons = sorted(people.values(), key=lambda p: (-p["duties"], p["full_name"].lower()))
+        for p in persons:
+            for key in ("duty_hours", "accrued_official", "accrued_unofficial", "deducted_official", "deducted_unofficial"):
+                p[key] = round(p[key], 2)
+            p["net_official"] = round(p["accrued_official"] - p["deducted_official"], 2)
+            p["net_unofficial"] = round(p["accrued_unofficial"] - p["deducted_unofficial"], 2)
+
+        months_list, (y, mo) = [], map(int, start.split("-"))
+        while f"{y:04d}-{mo:02d}" <= end:
+            key = f"{y:04d}-{mo:02d}"
+            m = by_month.get(key, {"official": 0, "unofficial": 0, "hours": 0.0})
+            months_list.append({"month": key, "official": m["official"], "unofficial": m["unofficial"],
+                                "hours": round(m["hours"], 2)})
+            y, mo = (y + 1, 1) if mo == 12 else (y, mo + 1)
+
+        return jsonify({
+            "from": start, "to": end, "kind": kind,
+            "totals": {
+                "duties": len(duties),
+                "planned": sum(p["planned"] for p in persons),
+                "people": sum(1 for p in persons if p["duties"]),
+                "duty_hours": round(sum(r["hours"] for r in duties), 2),
+                "official": {k: round(v, 2) for k, v in sources["official"].items()},
+                "unofficial": {k: round(v, 2) for k, v in sources["unofficial"].items()},
+            },
+            "weekday": weekday,
+            "months": months_list,
+            "roles": sorted(({**r, "official_hours": round(r["official_hours"], 2),
+                              "unofficial_hours": round(r["unofficial_hours"], 2)} for r in by_role.values()),
+                            key=lambda r: -r["duties"]),
+            "people": persons,
+        })
+
     # ---------- Месяцы с данными ----------
     @app.get("/api/months")
     def months():
