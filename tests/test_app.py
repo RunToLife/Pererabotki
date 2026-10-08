@@ -398,6 +398,41 @@ class AppTest(unittest.TestCase):
         self.assertEqual(self.c.get("/api/analytics?from=2026-13").status_code, 400)
         self.assertEqual(self.c.get("/api/analytics?from=2026-01&kind=x").status_code, 400)
 
+    def test_holiday_flags_on_duties_and_in_analytics(self):
+        a, b = self.emp("Андреев А. А."), self.emp("Борисов Б. Б.")
+        d1 = self.c.post("/api/duties", json={"date": "2026-12-31", "employee_id": a, "preholiday": True}).get_json()
+        self.assertEqual((d1["holiday"], d1["preholiday"]), (0, 1))
+        self.c.post("/api/duties", json={"date": "2027-01-01", "employee_id": a, "holiday": True})
+        self.c.post("/api/duties", json={"date": "2027-01-02", "employee_id": a, "holiday": True})
+        self.c.post("/api/duties", json={"date": "2027-01-01", "employee_id": b, "holiday": True, "kind": "unofficial"})
+        self.c.post("/api/duties", json={"date": "2027-01-10", "employee_id": b})
+        both = {"date": "2027-01-11", "employee_id": b, "holiday": True, "preholiday": True}
+        self.assertEqual(self.c.post("/api/duties", json=both).status_code, 400)
+        self.assertEqual(self.c.post("/api/duties", json={**both, "preholiday": "да"}).status_code, 400)
+
+        listed = self.c.get("/api/duties?month=2027-01").get_json()
+        self.assertEqual(sorted((x["duty_date"], x["holiday"]) for x in listed if x["employee_id"] == a),
+                         [("2027-01-01", 1), ("2027-01-02", 1)])
+
+        # правка без отметок их не сбрасывает; явная правка меняет и пишется в аудит
+        self.c.put(f"/api/duties/{d1['id']}", json={"hours": 12})
+        self.assertEqual(self.c.get("/api/duties?month=2026-12").get_json()[0]["preholiday"], 1)
+        self.c.put(f"/api/duties/{d1['id']}", json={"hours": 12, "preholiday": False, "holiday": True})
+        row = self.c.get("/api/duties?month=2026-12").get_json()[0]
+        self.assertEqual((row["holiday"], row["preholiday"]), (1, 0))
+        entry = self.c.get("/api/audit?entity=duty").get_json()["items"][0]
+        self.assertIn("Праздник", entry["summary"])
+        self.c.put(f"/api/duties/{d1['id']}", json={"hours": 12, "preholiday": True, "holiday": False})
+
+        r = self.c.get("/api/analytics?from=2026-12&to=2027-01").get_json()
+        self.assertEqual((r["totals"]["holiday"], r["totals"]["preholiday"]), (3, 1))
+        people = {p["full_name"]: p for p in r["people"]}
+        pa, pb = people["Андреев А. А."], people["Борисов Б. Б."]
+        self.assertEqual((pa["holiday"], pa["preholiday"]), (2, 1))
+        self.assertEqual(pa["holiday_dates"], ["2027-01-01", "2027-01-02"])
+        self.assertEqual(pa["by_kind"]["official"]["preholiday_dates"], ["2026-12-31"])
+        self.assertEqual((pb["by_kind"]["unofficial"]["holiday"], pb["by_kind"]["official"]["holiday"]), (1, 0))
+
     def test_balances_recomputed_on_start(self):
         eid = self.emp()
         self.c.post("/api/hours/official", json={"date": "2026-09-01", "employee_id": eid, "hours": 4})

@@ -152,6 +152,23 @@ tfoot td { font: 800 13px var(--f-mono); border-top: var(--bd); border-bottom: 0
 .day.out { background: transparent; border-style: dashed; min-height: 0; opacity: .35; }
 .day.weekend { background: repeating-linear-gradient(135deg, var(--mint-2) 0 6px, var(--paper) 6px 12px); }
 .day.today { background: var(--amber); box-shadow: var(--shadow-sm); }
+/* Праздник — заметно краснее, предпраздник — чуть розовее; «сегодня» остаётся янтарным, но с красной рамкой */
+.day.preholiday { background: #ffe9e6; }
+.day.holiday { background: #ffcfca; }
+.day.weekend.preholiday { background: repeating-linear-gradient(135deg, #ffd9d4 0 6px, #ffe9e6 6px 12px); }
+.day.weekend.holiday { background: repeating-linear-gradient(135deg, #ffb8b0 0 6px, #ffcfca 6px 12px); }
+.day.today.holiday, .day.today.preholiday { background: var(--amber); box-shadow: inset 0 0 0 3px var(--red); }
+.day.holiday .dnum span, .day.preholiday .dnum span { color: var(--red-ink); }
+.chip .hol { color: var(--red-ink); }
+.legend .key-day { width: 14px; height: 14px; border: 2px solid var(--ink); }
+.legend .key-day.holiday { background: #ffcfca; } .legend .key-day.preholiday { background: #ffe9e6; }
+dialog .flags { display: flex; flex-wrap: wrap; gap: 16px; }
+dialog label.check { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-weight: 600; }
+dialog label.check > span { color: var(--ink); font-size: 12px; }
+dialog label.check input { padding: 0; width: 18px; height: 18px; margin: 0; accent-color: var(--red-ink); }
+th.hol { color: var(--red-ink); }
+td.hol-cell.holiday { background: #ffcfca; } td.hol-cell.preholiday { background: #ffe9e6; }
+td.hol-cell small { display: block; font-weight: 400; white-space: nowrap; }
 .day .dnum { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; font: 700 13px var(--f-mono); }
 .day .add { width: 22px; height: 22px; padding: 0; cursor: pointer; background: var(--paper); border: var(--bd); font: 700 14px/1 var(--f-mono); }
 .day .add:hover { background: var(--green); }
