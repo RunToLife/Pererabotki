@@ -161,6 +161,21 @@ async function loadUser({ tryWindows = true } = {}) {
   }
 }
 
+// ---------- Остаток часов (таблица balances, одна на все окна) ----------
+function balNum(n) { return `<b class="${n < 0 ? "neg" : ""}">${fmtNum(n)}</b>`; }
+function balanceOf(id) {
+  const e = state.employees.find((x) => x.id === id);
+  return e ? { official: e.balance_official, unofficial: e.balance_unofficial } : { official: 0, unofficial: 0 };
+}
+/** Карточка «Остаток часов»: начислено минус списано за всё время, по каждому дежурному. */
+function balanceCard() {
+  const items = state.employees.map((e) => `<li><div class="who"><b>${esc(e.full_name)}</b><small>${esc(e.position)}</small></div>
+    <div class="nums"><span><em>офиц.</em>${balNum(e.balance_official)}</span><span><em>неофиц.</em>${balNum(e.balance_unofficial)}</span></div></li>`).join("");
+  return card("Остаток часов", items
+    ? `<ul class="kv">${items}</ul><p class="muted" style="padding:0 16px 12px">За всё время: начислено минус списано.</p>`
+    : '<div class="empty">Нет дежурных.</div>', { flush: true });
+}
+
 // ---------- Календарь (общий для графика дежурств и отгулов) ----------
 /** items — записи месяца; dateOf(x) — дата записи; chip(x) — HTML плашки; addLabel — подсказка кнопки «+». */
 function calendar(items, dateOf, chip, addLabel) {
@@ -220,7 +235,8 @@ async function renderSchedule(seq) {
   view.innerHTML = `<div class="split">
     ${card(monthTitle(state.month), calendar(duties, (d) => d.duty_date, chip, "Назначить дежурного") + legend,
       { right: badge(`${duties.length} ${plural(duties.length, ["дежурство", "дежурства", "дежурств"])}`, duties.length ? "green" : "") })}
-    <aside class="rail">${card("По сотрудникам", rank ? `<ul class="kv">${rank}</ul>` : '<div class="empty">В этом месяце дежурств нет.</div>', { flush: true })}</aside>
+    <aside class="rail">${card("По графику за месяц", rank ? `<ul class="kv">${rank}</ul>` : '<div class="empty">В этом месяце дежурств нет.</div>', { flush: true })}
+      ${balanceCard()}</aside>
   </div>`;
 
   const payload = (d) => ({ kind: d.kind, role: d.role, hours: Number(d.hours), note: d.note });
@@ -255,9 +271,7 @@ function dayoffFields(x) {
 }
 
 async function renderDayoffs(seq) {
-  const [offs, balance] = await Promise.all([
-    api("GET", `/api/dayoffs?month=${state.month}`), api("GET", "/api/balance"),
-  ]);
+  const offs = await api("GET", `/api/dayoffs?month=${state.month}`);
   if (isStale(seq)) return;
   const chip = (x) => {
     const title = `${x.full_name} — ${x.position}\nОтгул: списано ${fmtNum(x.hours)} ч из «${HOURS_KIND[x.kind]}»` + (x.note ? `\n${x.note}` : "");
@@ -266,20 +280,15 @@ async function renderDayoffs(seq) {
         <small>−${fmtNum(x.hours)} ч ${x.kind === "official" ? "офиц." : "неофиц."}</small></button>
       <button data-del-off="${x.id}" title="Отменить отгул" aria-label="Отменить отгул">×</button></div>`;
   };
-  const num = (n) => `<b class="${n < 0 ? "neg" : ""}">${fmtNum(n)}</b>`;
-  const bal = balance.map((b) => `<li><div class="who"><b>${esc(b.full_name)}</b><small>${esc(b.position)}</small></div>
-    <div class="nums"><span><em>офиц.</em>${num(b.official)}</span><span><em>неофиц.</em>${num(b.unofficial)}</span></div></li>`).join("");
   const total = offs.reduce((s, x) => s + x.hours, 0);
 
   view.innerHTML = `<div class="split">
     ${card(monthTitle(state.month), calendar(offs, (x) => x.off_date, chip, "Поставить отгул")
       + '<div class="legend"><span>Нажмите на плашку, чтобы изменить отгул; × — отменить и вернуть часы</span></div>',
       { right: badge(`${offs.length} ${plural(offs.length, ["отгул", "отгула", "отгулов"])} · ${fmtNum(total)} ч`, offs.length ? "red" : "") })}
-    <aside class="rail">${card("Остаток часов", bal ? `<ul class="kv">${bal}</ul><p class="muted" style="padding:0 16px 12px">За всё время: начислено минус списано.</p>`
-      : '<div class="empty">Нет дежурных.</div>', { flush: true })}</aside>
+    <aside class="rail">${balanceCard()}</aside>
   </div>`;
 
-  const balanceOf = (id) => balance.find((b) => b.employee_id === id) || { official: 0, unofficial: 0 };
   const payload = (d) => ({ kind: d.kind, hours: Number(d.hours), note: d.note });
   const warnIfShort = (id, d, already = 0) => {
     const left = balanceOf(id)[d.kind] + already - Number(d.hours);
@@ -383,7 +392,8 @@ async function renderHours(kind, seq) {
         <ul id="checks" class="checks" aria-live="polite"></ul>
         <button class="btn approve block" type="submit">Добавить</button></form>
         ${state.employees.length ? "" : '<p class="muted">Сначала добавьте дежурных на вкладке «Дежурные».</p>'}`)}
-      ${card("Сводка по сотрудникам", sumRows ? `<ul class="kv">${sumRows}</ul>` : '<div class="empty">Нет данных за месяц.</div>', { flush: true })}
+      ${card("Сводка за месяц", sumRows ? `<ul class="kv">${sumRows}</ul>` : '<div class="empty">Нет данных за месяц.</div>', { flush: true })}
+      ${balanceCard()}
     </aside></div>`;
 
   const form = $("#addform");
@@ -424,9 +434,11 @@ function employeeFields(e) {
 
 async function renderEmployees() {
   const rows = state.employees.map((e) => `<tr><td>${esc(e.full_name)}</td><td>${esc(e.position)}</td>
+    <td class="num ${e.balance_official < 0 ? "neg" : ""}">${fmtNum(e.balance_official)}</td>
+    <td class="num ${e.balance_unofficial < 0 ? "neg" : ""}">${fmtNum(e.balance_unofficial)}</td>
     <td class="actions"><button class="btn sm warn" data-edit="${e.id}">Изменить</button><button class="btn sm danger" data-del="${e.id}">Удалить</button></td></tr>`).join("");
   const table = rows
-    ? `<div class="table-wrap"><table><thead><tr><th>ФИО</th><th>Должность</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`
+    ? `<div class="table-wrap"><table><thead><tr><th>ФИО</th><th>Должность</th><th class="num" title="Остаток за всё время: начислено минус списано">Офиц. ч</th><th class="num" title="Остаток за всё время: начислено минус списано">Неофиц. ч</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`
     : '<div class="empty">Список пуст. Добавьте первого дежурного.</div>';
   view.innerHTML = `<div class="split">
     ${card("Список дежурных", table, { flush: true, right: badge(String(state.employees.length), "", true) })}

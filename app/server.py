@@ -110,6 +110,63 @@ MIGRATIONS = {
 POST_MIGRATION_SQL = """
 CREATE UNIQUE INDEX IF NOT EXISTS idx_hours_duty ON hours(duty_id) WHERE duty_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_hours_dayoff ON hours(dayoff_id) WHERE dayoff_id IS NOT NULL;
+
+-- Остаток часов дежурного: запись создаётся вместе с дежурным и меняется триггерами при любом
+-- изменении таблицы hours (ручной ввод, автоначисление за дежурство, списание за отгул, правки, удаление),
+-- поэтому во всех окнах видны одни и те же числа.
+CREATE TABLE IF NOT EXISTS balances (
+    employee_id INTEGER PRIMARY KEY REFERENCES employees(id),
+    official    REAL NOT NULL DEFAULT 0,
+    unofficial  REAL NOT NULL DEFAULT 0,
+    updated_at  TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS trg_balance_on_employee AFTER INSERT ON employees BEGIN
+    INSERT OR IGNORE INTO balances (employee_id, official, unofficial, updated_at)
+    VALUES (NEW.id, 0, 0, datetime('now', 'localtime'));
+END;
+CREATE TRIGGER IF NOT EXISTS trg_balance_hours_insert AFTER INSERT ON hours BEGIN
+    INSERT OR IGNORE INTO balances (employee_id, official, unofficial, updated_at)
+    VALUES (NEW.employee_id, 0, 0, datetime('now', 'localtime'));
+    UPDATE balances SET
+        official   = round(official   + CASE WHEN NEW.kind = 'official'   THEN NEW.hours ELSE 0 END, 2),
+        unofficial = round(unofficial + CASE WHEN NEW.kind = 'unofficial' THEN NEW.hours ELSE 0 END, 2),
+        updated_at = datetime('now', 'localtime')
+    WHERE employee_id = NEW.employee_id;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_balance_hours_delete AFTER DELETE ON hours BEGIN
+    UPDATE balances SET
+        official   = round(official   - CASE WHEN OLD.kind = 'official'   THEN OLD.hours ELSE 0 END, 2),
+        unofficial = round(unofficial - CASE WHEN OLD.kind = 'unofficial' THEN OLD.hours ELSE 0 END, 2),
+        updated_at = datetime('now', 'localtime')
+    WHERE employee_id = OLD.employee_id;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_balance_hours_update AFTER UPDATE OF kind, hours, employee_id ON hours BEGIN
+    UPDATE balances SET
+        official   = round(official   - CASE WHEN OLD.kind = 'official'   THEN OLD.hours ELSE 0 END, 2),
+        unofficial = round(unofficial - CASE WHEN OLD.kind = 'unofficial' THEN OLD.hours ELSE 0 END, 2),
+        updated_at = datetime('now', 'localtime')
+    WHERE employee_id = OLD.employee_id;
+    INSERT OR IGNORE INTO balances (employee_id, official, unofficial, updated_at)
+    VALUES (NEW.employee_id, 0, 0, datetime('now', 'localtime'));
+    UPDATE balances SET
+        official   = round(official   + CASE WHEN NEW.kind = 'official'   THEN NEW.hours ELSE 0 END, 2),
+        unofficial = round(unofficial + CASE WHEN NEW.kind = 'unofficial' THEN NEW.hours ELSE 0 END, 2),
+        updated_at = datetime('now', 'localtime')
+    WHERE employee_id = NEW.employee_id;
+END;
+"""
+
+# При каждом запуске остатки пересчитываются по истории часов: так появляются записи для дежурных,
+# созданных до этой версии, и исправляются расхождения, если базу правили вручную.
+RECOMPUTE_BALANCES_SQL = """
+INSERT OR IGNORE INTO balances (employee_id, official, unofficial, updated_at)
+    SELECT id, 0, 0, datetime('now', 'localtime') FROM employees;
+UPDATE balances SET
+    official   = round(COALESCE((SELECT SUM(hours) FROM hours h
+                                 WHERE h.employee_id = balances.employee_id AND h.kind = 'official'), 0), 2),
+    unofficial = round(COALESCE((SELECT SUM(hours) FROM hours h
+                                 WHERE h.employee_id = balances.employee_id AND h.kind = 'unofficial'), 0), 2),
+    updated_at = datetime('now', 'localtime');
 """
 
 KIND_LABEL = {"official": "Официальные часы", "unofficial": "Неофициальные часы"}
@@ -201,6 +258,7 @@ def migrate(conn):
                     conn.execute("UPDATE duties SET accrued_at='до автоначисления' WHERE duty_date<=?",
                                  (date.today().isoformat(),))
     conn.executescript(POST_MIGRATION_SQL)
+    conn.executescript(RECOMPUTE_BALANCES_SQL)
     conn.commit()
 
 
@@ -570,10 +628,12 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
     # ---------- Дежурные (сотрудники) ----------
     @app.get("/api/employees")
     def list_employees():
-        sql = "SELECT * FROM employees"
+        sql = ("SELECT e.*, COALESCE(b.official, 0) AS balance_official,"
+               " COALESCE(b.unofficial, 0) AS balance_unofficial"
+               " FROM employees e LEFT JOIN balances b ON b.employee_id=e.id")
         if request.args.get("all") != "1":
-            sql += " WHERE active=1"
-        rows = db().execute(sql + " ORDER BY full_name COLLATE NOCASE").fetchall()
+            sql += " WHERE e.active=1"
+        rows = db().execute(sql + " ORDER BY e.full_name COLLATE NOCASE").fetchall()
         return jsonify([dict(r) for r in rows])
 
     def employee_payload():
@@ -810,15 +870,14 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
 
     @app.get("/api/balance")
     def balance():
-        """Остаток часов за всё время: начислено минус списано, по каждому активному сотруднику."""
+        """Остаток часов за всё время (таблица balances): начислено минус списано, по активным дежурным."""
         rows = db().execute(
             "SELECT e.id AS employee_id, e.full_name, e.position,"
-            " COALESCE(SUM(CASE WHEN h.kind='official' THEN h.hours END), 0) AS official,"
-            " COALESCE(SUM(CASE WHEN h.kind='unofficial' THEN h.hours END), 0) AS unofficial"
-            " FROM employees e LEFT JOIN hours h ON h.employee_id=e.id"
-            " WHERE e.active=1 GROUP BY e.id ORDER BY e.full_name COLLATE NOCASE"
+            " COALESCE(b.official, 0) AS official, COALESCE(b.unofficial, 0) AS unofficial, b.updated_at"
+            " FROM employees e LEFT JOIN balances b ON b.employee_id=e.id"
+            " WHERE e.active=1 ORDER BY e.full_name COLLATE NOCASE"
         ).fetchall()
-        return jsonify([dict(r, official=round(r["official"], 2), unofficial=round(r["unofficial"], 2)) for r in rows])
+        return jsonify([dict(r) for r in rows])
 
     # ---------- Часы переработки ----------
     def check_kind(kind):

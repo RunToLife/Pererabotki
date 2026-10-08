@@ -293,6 +293,56 @@ class AppTest(unittest.TestCase):
         # прошлые дежурства из старой базы задним числом не начисляются (часы могли внести вручную)
         self.assertEqual(c.get("/api/hours/official?month=2026-01").get_json(), [])
 
+    # --- остатки часов (таблица balances) ---
+    def bal(self, eid):
+        b = next(x for x in self.c.get("/api/balance").get_json() if x["employee_id"] == eid)
+        e = next(x for x in self.c.get("/api/employees").get_json() if x["id"] == eid)
+        self.assertEqual((b["official"], b["unofficial"]), (e["balance_official"], e["balance_unofficial"]))
+        return b["official"], b["unofficial"]
+
+    def test_balance_record_created_with_employee(self):
+        eid = self.emp()
+        with sqlite3.connect(self.app.config["DB_PATH"]) as conn:
+            row = conn.execute("SELECT official, unofficial FROM balances WHERE employee_id=?", (eid,)).fetchone()
+        self.assertEqual(row, (0, 0))
+        self.assertEqual(self.bal(eid), (0, 0))
+
+    def test_balance_follows_every_hours_change(self):
+        eid = self.emp()
+        hid = self.c.post("/api/hours/official", json={"date": "2026-09-01", "employee_id": eid,
+                                                       "hours": 5}).get_json()["id"]
+        self.c.post("/api/hours/unofficial", json={"date": "2026-09-02", "employee_id": eid, "hours": 2.5})
+        self.assertEqual(self.bal(eid), (5, 2.5))
+        self.c.put(f"/api/hours/official/{hid}", json={"date": "2026-09-01", "employee_id": eid, "hours": 7})
+        self.assertEqual(self.bal(eid), (7, 2.5))
+        # дежурство: автоначисление, смена типа, снятие
+        past = (date.today() - timedelta(days=1)).isoformat()
+        did = self.c.post("/api/duties", json={"date": past, "employee_id": eid, "hours": 12}).get_json()["id"]
+        self.assertEqual(self.bal(eid), (19, 2.5))
+        self.c.put(f"/api/duties/{did}", json={"kind": "unofficial", "hours": 12})
+        self.assertEqual(self.bal(eid), (7, 14.5))
+        self.c.delete(f"/api/duties/{did}")
+        self.assertEqual(self.bal(eid), (7, 2.5))
+        # отгул: списание, изменение, отмена
+        off = self.c.post("/api/dayoffs", json={"date": "2026-09-10", "employee_id": eid}).get_json()["id"]
+        self.assertEqual(self.bal(eid), (-1, 2.5))
+        self.c.put(f"/api/dayoffs/{off}", json={"kind": "unofficial", "hours": 2})
+        self.assertEqual(self.bal(eid), (7, 0.5))
+        self.c.delete(f"/api/dayoffs/{off}")
+        self.c.delete(f"/api/hours/official/{hid}")
+        self.assertEqual(self.bal(eid), (0, 2.5))
+
+    def test_balances_recomputed_on_start(self):
+        eid = self.emp()
+        self.c.post("/api/hours/official", json={"date": "2026-09-01", "employee_id": eid, "hours": 4})
+        db_path = self.app.config["DB_PATH"]
+        with sqlite3.connect(db_path) as conn:  # расхождение: базу правили в обход сервиса
+            conn.execute("UPDATE balances SET official=999")
+            conn.execute("DELETE FROM balances")
+        c = create_app(db_path).test_client()
+        b = c.get("/api/balance").get_json()[0]
+        self.assertEqual((b["official"], b["unofficial"]), (4, 0))
+
     def test_index_served(self):
         r = self.c.get("/")
         self.assertEqual(r.status_code, 200)
