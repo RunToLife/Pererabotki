@@ -1,7 +1,7 @@
 @echo off
 rem Автоматическая установка и запуск сервиса "Переработка" (Windows).
-rem   install.bat                 установить, включить автозапуск при входе и запустить
-rem   install.bat --no-autostart  только установить зависимости
+rem   install.bat                 установить и запустить (автозапуск при входе в Windows НЕ настраивается)
+rem   install.bat --no-start      только установить зависимости, не запускать (--no-autostart - то же самое)
 rem   set PERER_PORT=9000 ^& install.bat   другой порт (по умолчанию 8080)
 chcp 65001 >nul
 setlocal EnableDelayedExpansion
@@ -60,20 +60,22 @@ if not exist "%ROOT%\vendor\wheels" ( echo ОШИБКА: нет папки vendo
 if errorlevel 1 ( echo ОШИБКА: не удалось установить зависимости & exit /b 1 )
 if not exist data mkdir data
 
-if /i "%~1"=="--no-autostart" (
-  echo.
-  echo Установка завершена ^(автозапуск пропущен^). Запуск вручную: start.bat
-  exit /b 0
+set "NOSTART="
+if /i "%~1"=="--no-start" set "NOSTART=1"
+if /i "%~1"=="--no-autostart" set "NOSTART=1"
+
+rem Автозапуск отключён: задачу в Планировщике больше не создаём.
+rem Задачу "Pererabotki", оставшуюся от прошлых версий установщика, удаляем.
+schtasks /Query /TN "Pererabotki" >nul 2>nul
+if not errorlevel 1 (
+  schtasks /Delete /TN "Pererabotki" /F >nul 2>nul
+  echo Удалена задача автозапуска "Pererabotki" от прошлой установки.
 )
 
-echo.
-echo ==^> Настройка автозапуска ^(планировщик заданий, при входе в Windows^)
-schtasks /Delete /TN "Pererabotki" /F >nul 2>nul
-schtasks /Create /TN "Pererabotki" /SC ONLOGON /RL LIMITED /F /TR "cmd /c set PERER_PORT=%PERER_PORT%& set PERER_HOST=%PERER_HOST%& \"%ROOT%\venv\Scripts\pythonw.exe\" \"%ROOT%\app\server.py\""
-if errorlevel 1 (
-  echo ПРЕДУПРЕЖДЕНИЕ: не удалось создать задачу автозапуска. Запускайте start.bat вручную.
-) else (
-  echo Автозапуск настроен: задача "Pererabotki"
+if defined NOSTART (
+  echo.
+  echo Установка завершена ^(сервис не запущен^). Запуск вручную: start.bat
+  exit /b 0
 )
 
 echo.
