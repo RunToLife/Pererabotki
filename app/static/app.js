@@ -193,8 +193,9 @@ function dutyFields(x) {
     <p class="muted">Часы автоматически попадут в таблицу «${esc(HOURS_KIND.official)}» или «${esc(HOURS_KIND.unofficial)}» (по типу дежурства) при наступлении дня дежурства.</p>`;
 }
 
-async function renderSchedule() {
+async function renderSchedule(seq) {
   const duties = await api("GET", `/api/duties?month=${state.month}`);
+  if (isStale(seq)) return;
   const chip = (x) => {
     const title = `${x.full_name} — ${x.position}\n${DUTY_KIND[x.kind]} дежурство · ${ROLE[x.role] || x.role} · ${fmtNum(x.hours)} ч`
       + (x.note ? `\n${x.note}` : "") + (x.accrued_at ? "\nЧасы начислены" : "\nЧасы будут начислены в день дежурства");
@@ -253,10 +254,11 @@ function dayoffFields(x) {
     <p class="muted">Часы сразу спишутся из выбранной таблицы (запись со знаком «−» на дату отгула). При отмене отгула часы вернутся.</p>`;
 }
 
-async function renderDayoffs() {
+async function renderDayoffs(seq) {
   const [offs, balance] = await Promise.all([
     api("GET", `/api/dayoffs?month=${state.month}`), api("GET", "/api/balance"),
   ]);
+  if (isStale(seq)) return;
   const chip = (x) => {
     const title = `${x.full_name} — ${x.position}\nОтгул: списано ${fmtNum(x.hours)} ч из «${HOURS_KIND[x.kind]}»` + (x.note ? `\n${x.note}` : "");
     return `<div class="chip off" title="${esc(title)}">
@@ -318,7 +320,12 @@ function hoursFields(row) {
 }
 
 /** Живые проверки формы: статус, текст. Сервер всё равно проверяет данные сам. */
-function hoursChecks(form, duties) {
+/** Дежурство того же типа у сотрудника в этот день: его часы уже начисляются автоматически. */
+function sameKindDuty(duties, kind, date, employeeId) {
+  return duties.find((d) => d.duty_date === date && String(d.employee_id) === String(employeeId) && d.kind === kind);
+}
+
+function hoursChecks(form, duties, kind) {
   const v = Object.fromEntries(new FormData(form));
   const hrs = parseFloat(v.hours);
   const items = [];
@@ -329,19 +336,23 @@ function hoursChecks(form, duties) {
   items.push(!v.date ? ["bad", "Укажите дату"]
     : inMonth ? ["ok", "Дата в выбранном месяце"] : ["warn", "Дата вне выбранного месяца — запись попадёт в другой месяц"]);
   if (inMonth && v.employee_id) {
-    const onDuty = duties.some((d) => d.duty_date === v.date && String(d.employee_id) === String(v.employee_id));
-    items.push(onDuty ? ["ok", "По графику сотрудник дежурит в этот день"] : ["warn", "По графику сотрудник в этот день не дежурит"]);
+    const same = sameKindDuty(duties, kind, v.date, v.employee_id);
+    const other = duties.find((d) => d.duty_date === v.date && String(d.employee_id) === String(v.employee_id) && d.kind !== kind);
+    items.push(same ? ["warn", `В этот день у сотрудника ${DUTY_KIND[kind].toLowerCase()} дежурство: его ${fmtNum(same.hours)} ч начисляются автоматически, ручная запись их задвоит`]
+      : other ? ["ok", `Дежурство в этот день ${DUTY_KIND[other.kind].toLowerCase()} — его часы идут в другую таблицу`]
+      : ["ok", "Дежурства в этот день нет — переработка вне графика"]);
   }
   const icon = { ok: "✓", warn: "!", bad: "✕", idle: "•" };
   return items.map(([s, t]) => `<li class="${s}"><i>${icon[s]}</i><span>${esc(t)}</span></li>`).join("");
 }
 
-async function renderHours(kind) {
+async function renderHours(kind, seq) {
   const [rows, summary, duties] = await Promise.all([
     api("GET", `/api/hours/${kind}?month=${state.month}`),
     api("GET", `/api/hours/summary?month=${state.month}`),
     api("GET", `/api/duties?month=${state.month}`),
   ]);
+  if (isStale(seq)) return;
   const total = rows.reduce((s, r) => s + r.hours, 0);
   const SOURCE_BADGE = { duty: ["Дежурство", KIND_BADGE[kind]], dayoff: ["Отгул", "red"], manual: ["Вручную", ""] };
   const body = rows.map((r) => {
@@ -376,13 +387,15 @@ async function renderHours(kind) {
     </aside></div>`;
 
   const form = $("#addform");
-  const refreshChecks = () => ($("#checks").innerHTML = hoursChecks(form, duties));
+  const refreshChecks = () => ($("#checks").innerHTML = hoursChecks(form, duties, kind));
   form.addEventListener("input", refreshChecks);
   form.addEventListener("change", refreshChecks);
   refreshChecks();
   form.onsubmit = (e) => {
     e.preventDefault();
     const d = Object.fromEntries(new FormData(form));
+    const same = sameKindDuty(duties, kind, d.date, d.employee_id);
+    if (same && !confirm(`Часы за дежурство ${d.date} (${fmtNum(same.hours)} ч) уже начисляются в эту таблицу автоматически.\nДобавить ещё одну запись вручную?`)) return;
     guarded(async () => {
       await api("POST", `/api/hours/${kind}`, { date: d.date, employee_id: Number(d.employee_id), hours: Number(d.hours), comment: d.comment });
       await render();
@@ -467,6 +480,7 @@ async function loadAudit(append) {
   Object.entries(auditFilters).forEach(([k, v]) => v && params.set(k, v));
   const data = await api("GET", `/api/audit?${params}`);
   const tbody = $("#audit-body");
+  if (!tbody) return; // пока шёл запрос, открыли другую вкладку
   const html = data.items.map(auditRow).join("");
   if (append) tbody.insertAdjacentHTML("beforeend", html);
   else tbody.innerHTML = html || '<tr><td colspan="5" class="muted">Записей нет.</td></tr>';
@@ -508,7 +522,14 @@ async function refreshHistory() {
     months.sort().reverse().map((m) => `<option value="${m}">${esc(monthTitle(m))}</option>`).join("");
 }
 
+/** Номер текущей отрисовки. Пока ждали ответа сервера, пользователь мог открыть другую вкладку или месяц:
+ *  тогда устаревшая отрисовка ничего не выводит, иначе данные графика дежурств попадали бы под заголовок
+ *  «График отгулов» или таблицы часов (а «+» в таком календаре назначал бы дежурство, а не отгул). */
+let renderSeq = 0;
+function isStale(seq) { return seq !== renderSeq; }
+
 async function render() {
+  const seq = ++renderSeq;
   const usesMonth = ["schedule", "dayoffs", "official", "unofficial"].includes(state.tab);
   $("#monthbar").hidden = !usesMonth;
   $("#month").value = state.month;
@@ -516,13 +537,16 @@ async function render() {
   $("#title").textContent = TABS[state.tab][1];
   document.querySelectorAll("#tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === state.tab));
   await guarded(async () => {
-    state.employees = await api("GET", "/api/employees");
+    const employees = await api("GET", "/api/employees");
+    if (isStale(seq)) return;
+    state.employees = employees;
     if (usesMonth) await refreshHistory();
-    if (state.tab === "schedule") await renderSchedule();
-    else if (state.tab === "dayoffs") await renderDayoffs();
+    if (isStale(seq)) return;
+    if (state.tab === "schedule") await renderSchedule(seq);
+    else if (state.tab === "dayoffs") await renderDayoffs(seq);
     else if (state.tab === "employees") await renderEmployees();
     else if (state.tab === "audit") await renderAudit();
-    else await renderHours(state.tab);
+    else await renderHours(state.tab, seq);
   });
 }
 
