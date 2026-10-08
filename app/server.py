@@ -94,17 +94,18 @@ CREATE INDEX IF NOT EXISTS idx_dayoffs_date ON dayoffs(off_date);
 """
 
 # Колонки, добавленные после первой версии: для существующих баз они добавляются через ALTER TABLE.
+# hours идёт первой: проверка ручных записей при добавлении duties.accrued_at опирается на hours.source.
 MIGRATIONS = {
+    "hours": [
+        ("source", "TEXT NOT NULL DEFAULT 'manual'"),
+        ("duty_id", "INTEGER"),
+        ("dayoff_id", "INTEGER"),
+    ],
     "duties": [
         ("kind", "TEXT NOT NULL DEFAULT 'official'"),
         ("hours", "REAL NOT NULL DEFAULT 24"),
         ("role", "TEXT NOT NULL DEFAULT 'duty'"),
         ("accrued_at", "TEXT"),
-    ],
-    "hours": [
-        ("source", "TEXT NOT NULL DEFAULT 'manual'"),
-        ("duty_id", "INTEGER"),
-        ("dayoff_id", "INTEGER"),
     ],
 }
 POST_MIGRATION_SQL = """
@@ -245,6 +246,18 @@ def duty_label(kind, role, hours):
     return f"{DUTY_KIND_LABEL[kind]} дежурство · {ROLE_LABEL.get(role, role)} · {fmt_hours(hours)} ч"
 
 
+# Часы по графику, которые ещё не начислены (день дежурства не наступил), по типам — для подсказки
+# «ещё начислится» рядом с остатком.
+PLANNED_SQL = ("COALESCE((SELECT SUM(d.hours) FROM duties d WHERE d.employee_id=e.id AND d.accrued_at IS NULL"
+               " AND d.kind='official'), 0) AS planned_official,"
+               " COALESCE((SELECT SUM(d.hours) FROM duties d WHERE d.employee_id=e.id AND d.accrued_at IS NULL"
+               " AND d.kind='unofficial'), 0) AS planned_unofficial")
+
+LEGACY_MARK = "до автоначисления"
+LEGACY_MANUAL_EXISTS = ("EXISTS (SELECT 1 FROM hours h WHERE h.employee_id=duties.employee_id"
+                        " AND h.work_date=duties.duty_date AND h.source='manual')")
+
+
 def migrate(conn):
     conn.executescript(SCHEMA)
     for table, columns in MIGRATIONS.items():
@@ -253,10 +266,16 @@ def migrate(conn):
             if name not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
                 if (table, name) == ("duties", "accrued_at"):
-                    # Дежурства, назначенные до появления автоначисления, часы за которые могли уже
-                    # внести вручную, не начисляем задним числом — только будущие.
-                    conn.execute("UPDATE duties SET accrued_at='до автоначисления' WHERE duty_date<=?",
-                                 (date.today().isoformat(),))
+                    # Прошедшие дежурства из старой базы начисляются как обычные, кроме дней, за которые
+                    # у сотрудника уже есть ручная запись часов (её, скорее всего, внесли за это дежурство).
+                    conn.execute(
+                        f"UPDATE duties SET accrued_at=? WHERE duty_date<=? AND {LEGACY_MANUAL_EXISTS}",
+                        (LEGACY_MARK, date.today().isoformat()),
+                    )
+    # Исправление: прежняя версия помечала «до автоначисления» ВСЕ прошедшие дежурства старой базы,
+    # и часы за них не начислялись вовсе. Снимаем пометку там, где ручной записи часов нет.
+    conn.execute(f"UPDATE duties SET accrued_at=NULL WHERE accrued_at=? AND NOT {LEGACY_MANUAL_EXISTS}",
+                 (LEGACY_MARK,))
     conn.executescript(POST_MIGRATION_SQL)
     conn.executescript(RECOMPUTE_BALANCES_SQL)
     conn.commit()
@@ -629,7 +648,7 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
     @app.get("/api/employees")
     def list_employees():
         sql = ("SELECT e.*, COALESCE(b.official, 0) AS balance_official,"
-               " COALESCE(b.unofficial, 0) AS balance_unofficial"
+               " COALESCE(b.unofficial, 0) AS balance_unofficial, " + PLANNED_SQL +
                " FROM employees e LEFT JOIN balances b ON b.employee_id=e.id")
         if request.args.get("all") != "1":
             sql += " WHERE e.active=1"
@@ -873,7 +892,8 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
         """Остаток часов за всё время (таблица balances): начислено минус списано, по активным дежурным."""
         rows = db().execute(
             "SELECT e.id AS employee_id, e.full_name, e.position,"
-            " COALESCE(b.official, 0) AS official, COALESCE(b.unofficial, 0) AS unofficial, b.updated_at"
+            " COALESCE(b.official, 0) AS official, COALESCE(b.unofficial, 0) AS unofficial, b.updated_at, "
+            + PLANNED_SQL +
             " FROM employees e LEFT JOIN balances b ON b.employee_id=e.id"
             " WHERE e.active=1 ORDER BY e.full_name COLLATE NOCASE"
         ).fetchall()
