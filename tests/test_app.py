@@ -178,7 +178,12 @@ class AppTest(unittest.TestCase):
         eid = self.emp()
         future = (date.today() + timedelta(days=3)).isoformat()
         d = self.c.post("/api/duties", json={"date": future, "employee_id": eid}).get_json()
-        self.assertEqual((d["kind"], d["hours"], d["role"], d["accrued_at"]), ("official", 24, "duty", None))
+        # часы официального дежурства по умолчанию — рекомендованные по правилам
+        rec = self.c.get(f"/api/duties/recommend?date={future}").get_json()["hours"]
+        self.assertEqual((d["kind"], d["hours"], d["role"], d["accrued_at"]), ("official", rec, "duty", None))
+        d2 = self.c.post("/api/duties", json={"date": future, "employee_id": self.emp("Петров П. П."),
+                                              "kind": "unofficial"}).get_json()
+        self.assertEqual(d2["hours"], 24)
         for bad in ({"kind": "x"}, {"role": "boss"}, {"hours": -1}, {"hours": 30}):
             body = {"date": (date.today() + timedelta(days=4)).isoformat(), "employee_id": eid, **bad}
             self.assertEqual(self.c.post("/api/duties", json=body).status_code, 400, bad)
@@ -188,7 +193,7 @@ class AppTest(unittest.TestCase):
     def test_duty_allows_zero_hours(self):
         eid = self.emp()
         past = (date.today() - timedelta(days=1)).isoformat()
-        r = self.c.post("/api/duties", json={"date": past, "employee_id": eid, "hours": 0})
+        r = self.c.post("/api/duties", json={"date": past, "employee_id": eid, "hours": 0, "sleep_next": False})
         self.assertEqual(r.status_code, 201, r.get_json())
         self.assertEqual(r.get_json()["hours"], 0)
         self.assertEqual([x["hours"] for x in self.hours("official", past[:7])], [0])
@@ -212,10 +217,82 @@ class AppTest(unittest.TestCase):
         self.assertEqual(a["actor"], "система")
         self.assertIn("+12 ч", a["summary"])
 
+    def test_official_duty_rules_recommend_hours_and_sleep(self):
+        eid = self.emp()
+
+        def rec(day, **flags):
+            q = "&".join(f"{k}=1" for k, v in flags.items() if v)
+            return self.c.get(f"/api/duties/recommend?date={day}&{q}").get_json()
+
+        def duty(day, **extra):
+            r = self.c.post("/api/duties", json={"date": day, "employee_id": eid, **extra})
+            self.assertEqual(r.status_code, 201, r.get_json())
+            return r.get_json()
+
+        def sleeps(month):
+            return [(o["off_date"], o["off_type"], o["kind"], o["hours"], o["duty_id"])
+                    for o in self.c.get(f"/api/dayoffs?month={month}").get_json()]
+
+        # 1. вторник → среда (рабочие): 12 ч и отсыпной 8 ч на среду
+        self.assertEqual((rec("2030-03-05")["hours"], rec("2030-03-05")["sleep"]), (12, True))
+        d1 = duty("2030-03-05")
+        self.assertEqual(d1["hours"], 12)
+        self.assertEqual(sleeps("2030-03"), [("2030-03-06", "sleep", "official", 8, d1["id"])])
+        self.assertEqual([x["hours"] for x in self.hours("official", "2030-03")], [-8])
+        self.assertIn("автоматически", self.audit(entity="dayoff")["items"][0]["summary"])
+        # 2. пятница или предпраздничный день: 13 ч, без отсыпного
+        self.assertEqual((rec("2030-03-08")["hours"], rec("2030-03-08")["sleep"]), (13, False))
+        self.assertEqual((rec("2030-04-30", preholiday=True)["hours"], rec("2030-04-30", preholiday=True)["sleep"]),
+                         (13, False))
+        # 3. выходной, следующий выходной: 20 ч, без отсыпного
+        self.assertEqual((rec("2030-03-09")["hours"], rec("2030-03-09")["sleep"]), (20, False))
+        # 4. выходной/праздник, следующий рабочий: 20 ч и отсыпной
+        self.assertEqual((rec("2030-03-10")["hours"], rec("2030-03-10")["sleep"]), (20, True))
+        self.assertEqual((rec("2030-05-01", holiday=True)["hours"], rec("2030-05-01", holiday=True)["sleep"]),
+                         (20, True))
+        # праздник, следующий день тоже праздник (отмечен у другого дежурства) — без отсыпного
+        duty("2030-05-02", holiday=True, sleep_next=False)
+        self.assertEqual(rec("2030-05-01", holiday=True)["case"], "weekend")
+        # среда перед праздничным четвергом — как предпраздник
+        self.assertEqual(rec("2030-05-01")["hours"], 13)
+
+        # рекомендацию можно изменить: свои часы и без отсыпного
+        d2 = duty("2030-03-12", hours=10, sleep_next=False)
+        self.assertEqual((d2["hours"], d2["sleep_dayoff_id"]), (10, None))
+        # неофициальное — без отсыпного и с 24 ч по умолчанию
+        d3 = duty("2030-03-18", kind="unofficial")
+        self.assertEqual((d3["hours"], d3["sleep_dayoff_id"]), (24, None))
+        self.assertEqual(len(sleeps("2030-03")), 1)
+
+        # снять отсыпной галочкой, вернуть галочкой
+        self.c.put(f"/api/duties/{d1['id']}", json={"hours": 12, "sleep_next": False})
+        self.assertEqual(sleeps("2030-03"), [])
+        self.assertEqual(self.hours("official", "2030-03"), [])
+        r = self.c.put(f"/api/duties/{d1['id']}", json={"hours": 12, "sleep_next": True}).get_json()
+        self.assertIsNotNone(r["sleep_dayoff_id"])
+        # правка без sleep_next отсыпной не трогает
+        self.c.put(f"/api/duties/{d1['id']}", json={"hours": 11})
+        self.assertEqual(len(sleeps("2030-03")), 1)
+        # смена на неофициальное убирает отсыпной, снятие дежурства — тоже
+        self.c.put(f"/api/duties/{d1['id']}", json={"kind": "unofficial"})
+        self.assertEqual(sleeps("2030-03"), [])
+        self.c.put(f"/api/duties/{d1['id']}", json={"kind": "official", "sleep_next": True})
+        self.assertEqual(len(sleeps("2030-03")), 1)
+        self.c.delete(f"/api/duties/{d1['id']}")
+        self.assertEqual(sleeps("2030-03"), [])
+        self.assertEqual(self.hours("official", "2030-03"), [])
+
+        # отгул на следующий день уже есть — второй не ставится, дежурство сохраняется с предупреждением
+        self.c.post("/api/dayoffs", json={"date": "2030-03-20", "employee_id": eid})
+        d4 = duty("2030-03-19")
+        self.assertIsNone(d4["sleep_dayoff_id"])
+        self.assertIn("не поставлен", d4["sleep_warning"])
+
     def test_past_duty_accrued_immediately_and_kinds_split(self):
         eid = self.emp()
         past = (date.today() - timedelta(days=1)).isoformat()
-        self.c.post("/api/duties", json={"date": past, "employee_id": eid, "kind": "official"})
+        self.c.post("/api/duties", json={"date": past, "employee_id": eid, "kind": "official", "hours": 24,
+                                         "sleep_next": False})
         eid2 = self.emp("Петров Пётр", "Техник")
         self.c.post("/api/duties", json={"date": past, "employee_id": eid2, "kind": "unofficial", "hours": 8,
                                          "role": "shift"})
@@ -373,7 +450,8 @@ class AppTest(unittest.TestCase):
         self.assertEqual(self.bal(eid), (7, 2.5))
         # дежурство: автоначисление, смена типа, снятие
         past = (date.today() - timedelta(days=1)).isoformat()
-        did = self.c.post("/api/duties", json={"date": past, "employee_id": eid, "hours": 12}).get_json()["id"]
+        did = self.c.post("/api/duties", json={"date": past, "employee_id": eid, "hours": 12,
+                                                    "sleep_next": False}).get_json()["id"]
         self.assertEqual(self.bal(eid), (19, 2.5))
         self.c.put(f"/api/duties/{did}", json={"kind": "unofficial", "hours": 12})
         self.assertEqual(self.bal(eid), (7, 14.5))
@@ -392,7 +470,7 @@ class AppTest(unittest.TestCase):
         a, b = self.emp("Андреев А. А."), self.emp("Борисов Б. Б.", "Техник")
         days = ["2026-08-03", "2026-08-10", "2026-08-15", "2026-09-07"]  # Пн, Пн, Сб, Пн
         for d in days:
-            self.c.post("/api/duties", json={"date": d, "employee_id": a})
+            self.c.post("/api/duties", json={"date": d, "employee_id": a, "hours": 24, "sleep_next": False})
         self.c.post("/api/duties", json={"date": "2026-09-08", "employee_id": b, "kind": "unofficial",
                                          "role": "assistant", "hours": 8})
         self.c.post("/api/dayoffs", json={"date": "2026-09-20", "employee_id": a, "hours": 8})

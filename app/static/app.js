@@ -22,6 +22,7 @@ const ROLE_SHORT = { duty: "Деж.", assistant: "Пом.", shift: "Смена",
 const DEFAULT_DUTY_HOURS = 24;
 const DEFAULT_DAYOFF_HOURS = 8;
 const OFF_TYPE = { dayoff: "Отгул", sleep: "Отсыпной" };
+const SLEEP_HOURS = 8;
 
 const $ = (sel) => document.querySelector(sel);
 const view = $("#view");
@@ -78,7 +79,7 @@ async function guarded(fn) {
 }
 
 // ---------- Диалог ----------
-function openForm(title, bodyHtml, onSubmit, submitLabel = "Сохранить") {
+function openForm(title, bodyHtml, onSubmit, submitLabel = "Сохранить", onOpen = null) {
   const dlg = $("#dialog");
   dlg.innerHTML = `<h3>${esc(title)}</h3><form method="dialog">${bodyHtml}
     <div class="actions"><button type="button" class="btn" id="dlg-cancel">Отмена</button>
@@ -95,6 +96,7 @@ function openForm(title, bodyHtml, onSubmit, submitLabel = "Сохранить")
   flags.forEach((box) => box.addEventListener("change", () => {
     if (box.checked) flags.forEach((other) => { if (other !== box) other.checked = false; });
   }));
+  if (onOpen) onOpen(form);
   dlg.showModal();
   const first = form.querySelector("input, select");
   if (first) first.focus();
@@ -210,15 +212,46 @@ function calendar(items, dateOf, chip, addLabel, dayClass = () => "") {
 
 // ---------- График дежурств ----------
 function dutyFields(x) {
-  const v = x || { kind: "official", hours: DEFAULT_DUTY_HOURS, role: "duty", note: "", holiday: 0, preholiday: 0 };
+  const v = x || { kind: "official", hours: DEFAULT_DUTY_HOURS, role: "duty", note: "", holiday: 0, preholiday: 0, sleep_dayoff_id: null };
   return `${x ? "" : `<label><span>Дежурный</span><select name="employee_id">${employeeOptions()}</select></label>`}
     <label><span>Тип дежурства</span><select name="kind">${options(DUTY_KIND, v.kind)}</select></label>
     <label><span>Роль</span><select name="role">${options(ROLE, v.role)}</select></label>
-    <label><span>Часы (по умолчанию ${DEFAULT_DUTY_HOURS})</span><input type="number" name="hours" min="0" max="24" step="0.25" value="${v.hours}" required></label>
     <div class="flags"><label class="check holiday"><input type="checkbox" name="holiday" ${v.holiday ? "checked" : ""}><span>Праздник</span></label>
       <label class="check preholiday"><input type="checkbox" name="preholiday" ${v.preholiday ? "checked" : ""}><span>Предпраздник</span></label></div>
+    <label><span>Часы (официальное — по рекомендации, неофициальное — ${DEFAULT_DUTY_HOURS})</span><input type="number" name="hours" min="0" max="24" step="0.25" value="${v.hours}" required></label>
+    <p class="rule-hint" data-rule hidden></p>
+    <label class="check sleep" data-sleep-box><input type="checkbox" name="sleep_next" ${v.sleep_dayoff_id ? "checked" : ""}><span>Отсыпной на следующий день (${SLEEP_HOURS} ч из «${esc(HOURS_KIND.official)}»)</span></label>
     <label><span>Примечание (необязательно)</span><input name="note" maxlength="300" value="${esc(v.note)}" placeholder="например, ночная смена"></label>
     <p class="muted">Часы автоматически попадут в таблицу «${esc(HOURS_KIND.official)}» или «${esc(HOURS_KIND.unofficial)}» (по типу дежурства) при наступлении дня дежурства.</p>`;
+}
+
+/** Подсказка по правилам официального дежурства: рекомендуемые часы и отсыпной на следующий день.
+ *  В новой форме рекомендация сразу подставляется в поля; в форме изменения — только после смены
+ *  типа дежурства или отметок «Праздник» / «Предпраздник», чтобы не затереть сохранённые значения. */
+function bindDutyRule(form, date, applyNow) {
+  const hint = form.querySelector("[data-rule]");
+  const sleepBox = form.querySelector("[data-sleep-box]");
+  let seq = 0;
+  const update = async (apply) => {
+    const official = form.elements.kind.value === "official";
+    sleepBox.hidden = !official;
+    if (!official) {
+      hint.hidden = true;
+      if (apply) { form.elements.hours.value = DEFAULT_DUTY_HOURS; form.elements.sleep_next.checked = false; }
+      return;
+    }
+    const my = ++seq;
+    const q = `date=${date}&holiday=${form.elements.holiday.checked ? 1 : 0}&preholiday=${form.elements.preholiday.checked ? 1 : 0}`;
+    let r;
+    try { r = await api("GET", `/api/duties/recommend?${q}`); } catch (err) { toast(err.message); return; }
+    if (my !== seq) return;
+    hint.textContent = `Рекомендуется ${fmtNum(r.hours)} ч: ${r.text}. `
+      + (r.sleep ? `Отсыпной ${fmtNum(r.sleep_hours)} ч на ${r.sleep_date}.` : "Отсыпной на следующий день не нужен.");
+    hint.hidden = false;
+    if (apply) { form.elements.hours.value = r.hours; form.elements.sleep_next.checked = r.sleep; }
+  };
+  ["kind", "holiday", "preholiday"].forEach((n) => form.elements[n].addEventListener("change", () => update(true)));
+  update(applyNow);
 }
 
 async function renderSchedule(seq) {
@@ -256,18 +289,20 @@ async function renderSchedule(seq) {
   </div>`;
 
   const payload = (d) => ({ kind: d.kind, role: d.role, hours: Number(d.hours), note: d.note,
-    holiday: d.holiday === "on", preholiday: d.preholiday === "on" });
+    holiday: d.holiday === "on", preholiday: d.preholiday === "on", sleep_next: d.sleep_next === "on" });
+  const afterSave = (res) => { if (res.sleep_warning) toast(res.sleep_warning); };
   view.querySelectorAll("[data-add]").forEach((btn) => (btn.onclick = () => {
     if (!state.employees.length) return toast("Сначала добавьте дежурных на вкладке «Дежурные»");
     const date = btn.dataset.add;
     openForm(`Дежурство ${date}`, dutyFields(),
-      async (d) => { await api("POST", "/api/duties", { date, employee_id: Number(d.employee_id), ...payload(d) }); await render(); },
-      "Назначить");
+      async (d) => { const res = await api("POST", "/api/duties", { date, employee_id: Number(d.employee_id), ...payload(d) }); await render(); afterSave(res); },
+      "Назначить", (form) => bindDutyRule(form, date, true));
   }));
   view.querySelectorAll("[data-edit-duty]").forEach((btn) => (btn.onclick = () => {
     const x = duties.find((d) => d.id === Number(btn.dataset.editDuty));
     openForm(`Дежурство ${x.duty_date}: ${x.full_name}`, dutyFields(x),
-      async (d) => { await api("PUT", `/api/duties/${x.id}`, payload(d)); await render(); });
+      async (d) => { const res = await api("PUT", `/api/duties/${x.id}`, payload(d)); await render(); afterSave(res); },
+      "Сохранить", (form) => bindDutyRule(form, x.duty_date, false));
   }));
   view.querySelectorAll("[data-del-duty]").forEach((btn) => (btn.onclick = () => {
     const x = duties.find((d) => d.id === Number(btn.dataset.delDuty));
@@ -292,10 +327,11 @@ async function renderDayoffs(seq) {
   const offs = await api("GET", `/api/dayoffs?month=${state.month}`);
   if (isStale(seq)) return;
   const chip = (x) => {
-    const title = `${x.full_name} — ${x.position}\n${OFF_TYPE[x.off_type]}: списано ${fmtNum(x.hours)} ч из «${HOURS_KIND[x.kind]}»` + (x.note ? `\n${x.note}` : "");
+    const title = `${x.full_name} — ${x.position}\n${OFF_TYPE[x.off_type]}: списано ${fmtNum(x.hours)} ч из «${HOURS_KIND[x.kind]}»` + (x.note ? `\n${x.note}` : "")
+      + (x.duty_id ? "\nПоставлен автоматически после официального дежурства" : "");
     return `<div class="chip off ${x.off_type}" title="${esc(title)}">
       <button class="edit" data-edit-off="${x.id}">${esc(x.full_name)}
-        <small><b class="otype">${x.off_type === "sleep" ? "Отсып." : "Отгул"}</b> · ${x.hours ? "−" : ""}${fmtNum(x.hours)} ч ${x.kind === "official" ? "офиц." : "неофиц."}</small></button>
+        <small><b class="otype">${x.off_type === "sleep" ? "Отсып." : "Отгул"}</b>${x.duty_id ? " · авто" : ""} · ${x.hours ? "−" : ""}${fmtNum(x.hours)} ч ${x.kind === "official" ? "офиц." : "неофиц."}</small></button>
       <button data-del-off="${x.id}" title="Отменить" aria-label="Отменить">×</button></div>`;
   };
   const total = offs.reduce((s, x) => s + x.hours, 0);

@@ -25,7 +25,7 @@ import re
 import sqlite3
 import sys
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -112,6 +112,7 @@ MIGRATIONS = {
     ],
     "dayoffs": [
         ("off_type", "TEXT NOT NULL DEFAULT 'dayoff'"),
+        ("duty_id", "INTEGER"),  # отсыпной, созданный автоматически после официального дежурства
     ],
 }
 POST_MIGRATION_SQL = """
@@ -182,6 +183,7 @@ ROLE_LABEL = {"duty": "Дежурный", "assistant": "Помощник деж�
 DEFAULT_DUTY_HOURS = 24
 DEFAULT_DAYOFF_HOURS = 8
 OFF_TYPE_LABEL = {"dayoff": "Отгул", "sleep": "Отсыпной"}
+SLEEP_HOURS = 8  # отсыпной после официального дежурства
 SYSTEM_ACTOR = "система"
 ENTITY_LABEL = {
     "employee": "Список дежурных",
@@ -262,6 +264,48 @@ PLANNED_SQL = ("COALESCE((SELECT SUM(d.hours) FROM duties d WHERE d.employee_id=
                " AND d.kind='official'), 0) AS planned_official,"
                " COALESCE((SELECT SUM(d.hours) FROM duties d WHERE d.employee_id=e.id AND d.accrued_at IS NULL"
                " AND d.kind='unofficial'), 0) AS planned_unofficial")
+
+def is_day_off(conn, day, holiday=False):
+    """Выходной (суббота, воскресенье) или праздник: у самого дежурства стоит «Праздник»
+    или в этот день есть другое дежурство с отметкой «Праздник»."""
+    if holiday or day.weekday() >= 5:
+        return True
+    return conn.execute("SELECT 1 FROM duties WHERE duty_date=? AND holiday=1 LIMIT 1",
+                        (day.isoformat(),)).fetchone() is not None
+
+
+def duty_rule(conn, duty_date, holiday, preholiday):
+    """Рекомендация для официального дежурства: сколько часов выставить и нужен ли отсыпной на следующий день.
+
+    1. Рабочий день, следующий тоже рабочий — 12 ч, отсыпной 8 ч на следующий день.
+    2. Пятница или предпраздничный день (следующий — выходной/праздник) — 13 ч, без отсыпного.
+    3. Выходной/праздник, следующий тоже выходной/праздник — 20 ч, без отсыпного.
+    4. Выходной/праздник, следующий рабочий — 20 ч, отсыпной 8 ч на следующий день.
+    """
+    day = date.fromisoformat(duty_date)
+    next_day = day + timedelta(days=1)
+    off_today = is_day_off(conn, day, holiday)
+    # «Предпраздник» у дежурства означает, что следующий день — праздник
+    off_next = bool(preholiday) or is_day_off(conn, next_day)
+    if not off_today and not off_next:
+        case, hours, sleep, text = "workday", 12, True, "рабочий день, следующий тоже рабочий"
+    elif not off_today:
+        case, hours, sleep, text = "preweekend", 13, False, "пятница или предпраздничный день"
+    elif off_next:
+        case, hours, sleep, text = "weekend", 20, False, "выходной или праздник, следующий день тоже нерабочий"
+    else:
+        case, hours, sleep, text = "weekend_then_work", 20, True, "выходной или праздник, следующий день рабочий"
+    return {"case": case, "hours": hours, "sleep": sleep, "sleep_date": next_day.isoformat(),
+            "sleep_hours": SLEEP_HOURS, "text": text}
+
+
+def parse_flag(value, field, default=None):
+    if value in (None, ""):
+        return default
+    if not isinstance(value, bool) and value not in (0, 1):
+        raise ApiError(f"{field}: ожидается true или false")
+    return bool(value)
+
 
 LEGACY_MARK = "до автоначисления"
 LEGACY_MANUAL_EXISTS = ("EXISTS (SELECT 1 FROM hours h WHERE h.employee_id=duties.employee_id"
@@ -751,6 +795,7 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
         month = parse_month(request.args.get("month"))
         rows = db().execute(
             "SELECT d.id, d.duty_date, d.employee_id, d.note, d.kind, d.hours, d.role, d.accrued_at, d.holiday, d.preholiday,"
+            " (SELECT o.id FROM dayoffs o WHERE o.duty_id=d.id) AS sleep_dayoff_id,"
             " e.full_name, e.position"
             " FROM duties d JOIN employees e ON e.id=d.employee_id"
             " WHERE substr(d.duty_date,1,7)=? ORDER BY d.duty_date, e.full_name COLLATE NOCASE",
@@ -758,9 +803,9 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
         ).fetchall()
         return jsonify([dict(r) for r in rows])
 
-    def duty_payload(data):
+    def duty_payload(data, default_hours=DEFAULT_DUTY_HOURS):
         return (parse_choice(data.get("kind"), DUTY_KIND_LABEL, "Тип дежурства", "official"),
-                parse_hours(DEFAULT_DUTY_HOURS if data.get("hours") in (None, "") else data.get("hours"), allow_zero=True),
+                parse_hours(default_hours if data.get("hours") in (None, "") else data.get("hours"), allow_zero=True),
                 parse_choice(data.get("role"), ROLE_LABEL, "Роль", "duty"),
                 clean_text(data.get("note"), "Примечание"))
 
@@ -778,13 +823,55 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
             raise ApiError("День не может быть одновременно праздником и предпраздничным")
         return tuple(flags)
 
+    @app.get("/api/duties/recommend")
+    def recommend_duty():
+        """Подсказка для формы: рекомендуемые часы официального дежурства и нужен ли отсыпной."""
+        duty_date = parse_date(request.args.get("date"))
+        holiday, preholiday = duty_flags({"holiday": request.args.get("holiday") in ("1", "true"),
+                                          "preholiday": request.args.get("preholiday") in ("1", "true")})
+        return jsonify(duty_rule(db(), duty_date, holiday, preholiday))
+
+    # ---------- Отсыпной после официального дежурства ----------
+    def linked_sleep(duty_id):
+        return db().execute("SELECT * FROM dayoffs WHERE duty_id=?", (duty_id,)).fetchone()
+
+    def create_sleep(duty):
+        """Ставит отсыпной (8 ч из «Официальных часов») на день после дежурства. Возвращает предупреждение
+        или None. Если у сотрудника на этот день уже есть отгул или отсыпной, второй не ставится."""
+        off_date = (date.fromisoformat(duty["duty_date"]) + timedelta(days=1)).isoformat()
+        employee = db().execute("SELECT * FROM employees WHERE id=?", (duty["employee_id"],)).fetchone()
+        if db().execute("SELECT 1 FROM dayoffs WHERE off_date=? AND employee_id=?",
+                        (off_date, duty["employee_id"])).fetchone():
+            return (f"Отсыпной на {off_date} не поставлен: у сотрудника уже есть отгул или отсыпной на этот день")
+        note = f"после дежурства {date.fromisoformat(duty['duty_date']).strftime('%d.%m.%Y')}"
+        insert_dayoff(off_date, employee, "official", SLEEP_HOURS, note, "sleep", duty_id=duty["id"],
+                      reason=f"автоматически после официального дежурства {duty['duty_date']}")
+        return None
+
+    def drop_sleep(duty_id, reason):
+        off = linked_sleep(duty_id)
+        if off:
+            remove_dayoff(off, reason)
+
+    def duty_response(duty_id, warning=None):
+        result = dict(get_duty(duty_id))
+        off = linked_sleep(duty_id)
+        result["sleep_dayoff_id"] = off["id"] if off else None
+        if warning:
+            result["sleep_warning"] = warning
+        return result
+
     @app.post("/api/duties")
     def add_duty():
         data = request.get_json(silent=True) or {}
         duty_date = parse_date(data.get("date"))
         employee = get_employee(data.get("employee_id") if isinstance(data.get("employee_id"), int) else -1)
-        kind, value, role, note = duty_payload(data)
         holiday, preholiday = duty_flags(data)
+        official = parse_choice(data.get("kind"), DUTY_KIND_LABEL, "Тип дежурства", "official") == "official"
+        # Для официального дежурства часы и отсыпной по умолчанию берутся из правил (их можно изменить)
+        rule = duty_rule(db(), duty_date, holiday, preholiday) if official else None
+        kind, value, role, note = duty_payload(data, rule["hours"] if rule else DEFAULT_DUTY_HOURS)
+        sleep_next = parse_flag(data.get("sleep_next"), "Отсыпной", rule["sleep"]) if rule else False
         try:
             cur = db().execute(
                 "INSERT INTO duties (duty_date, employee_id, note, kind, hours, role, holiday, preholiday)"
@@ -797,9 +884,10 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
         audit("create", "duty", row["id"],
               f"Назначил дежурство {duty_date}: {employee['full_name']} ({duty_label(kind, role, value)})",
               new=duty_snapshot(row))
+        warning = create_sleep(row) if sleep_next else None
         db().commit()
         accrue_due_duties(db())  # если день уже наступил — начислить сразу
-        return jsonify(dict(db().execute("SELECT * FROM duties WHERE id=?", (row["id"],)).fetchone())), 201
+        return jsonify(duty_response(row["id"], warning)), 201
 
     def get_duty(duty_id):
         row = db().execute("SELECT * FROM duties WHERE id=?", (duty_id,)).fetchone()
@@ -811,7 +899,10 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
     def update_duty(duty_id):
         row = get_duty(duty_id)
         data = request.get_json(silent=True) or {}
-        kind, value, role, note = duty_payload(data)
+        kind, value, role, note = duty_payload(data, row["hours"])
+        # Отсыпной: true — поставить, false — убрать, не передан — оставить как есть.
+        # У неофициального дежурства автоматического отсыпного нет.
+        sleep_next = parse_flag(data.get("sleep_next"), "Отсыпной") if kind == "official" else False
         # не переданные отметки не трогаем — старые клиенты не сбросят их случайно
         holiday, preholiday = duty_flags({"holiday": data.get("holiday", bool(row["holiday"])),
                                           "preholiday": data.get("preholiday", bool(row["preholiday"]))})
@@ -824,14 +915,21 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
                   f"Изменил дежурство {row['duty_date']} ({before['Сотрудник']}): {changes_text(old, new)}", old, new)
             comment = duty_label(kind, role, value) + (f" · {note}" if note else "")
             sync_linked_hours("duty_id", duty_id, kind, value, comment, "дежурство изменено")
-            db().commit()
-        return jsonify(dict(get_duty(duty_id)))
+        warning = None
+        if sleep_next is True and not linked_sleep(duty_id):
+            warning = create_sleep(get_duty(duty_id))
+        elif sleep_next is False:
+            drop_sleep(duty_id, "снят вместе с отметкой «Отсыпной» у дежурства" if kind == "official"
+                       else "дежурство стало неофициальным, часы возвращены")
+        db().commit()
+        return jsonify(duty_response(duty_id, warning))
 
     @app.delete("/api/duties/<int:duty_id>")
     def delete_duty(duty_id):
         row = get_duty(duty_id)
         snap = duty_snapshot(row)
         drop_linked_hours("duty_id", duty_id, "дежурство снято")
+        drop_sleep(duty_id, "дежурство снято, часы возвращены")
         db().execute("DELETE FROM duties WHERE id=?", (duty_id,))
         audit("delete", "duty", duty_id,
               f"Снял с дежурства {row['duty_date']}: {snap['Сотрудник']}", old=snap)
@@ -843,7 +941,7 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
     def list_dayoffs():
         month = parse_month(request.args.get("month"))
         rows = db().execute(
-            "SELECT o.id, o.off_date, o.employee_id, o.kind, o.hours, o.note, o.off_type, o.created_by,"
+            "SELECT o.id, o.off_date, o.employee_id, o.kind, o.hours, o.note, o.off_type, o.created_by, o.duty_id,"
             " e.full_name, e.position FROM dayoffs o JOIN employees e ON e.id=o.employee_id"
             " WHERE substr(o.off_date,1,7)=? ORDER BY o.off_date, e.full_name COLLATE NOCASE",
             (month,),
@@ -866,27 +964,22 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
             raise ApiError("Отгул не найден", 404)
         return row
 
-    @app.post("/api/dayoffs")
-    def add_dayoff():
-        data = request.get_json(silent=True) or {}
-        off_date = parse_date(data.get("date"))
-        employee = get_employee(data.get("employee_id") if isinstance(data.get("employee_id"), int) else -1)
-        kind, value, note, off_type = dayoff_payload(data)
+    def insert_dayoff(off_date, employee, kind, value, note, off_type, duty_id=None, reason=None):
+        """Ставит отгул/отсыпной и списывает часы: отрицательная запись в соответствующей таблице часов."""
         ts = now_str()
         try:
             cur = db().execute(
-                "INSERT INTO dayoffs (off_date, employee_id, kind, hours, note, off_type, created_by, created_at)"
-                " VALUES (?,?,?,?,?,?,?,?)",
-                (off_date, employee["id"], kind, value, note, off_type, g.actor, ts),
+                "INSERT INTO dayoffs (off_date, employee_id, kind, hours, note, off_type, created_by, created_at,"
+                " duty_id) VALUES (?,?,?,?,?,?,?,?,?)",
+                (off_date, employee["id"], kind, value, note, off_type, g.actor, ts, duty_id),
             )
         except sqlite3.IntegrityError:
             raise ApiError("У этого сотрудника уже есть отгул или отсыпной на выбранную дату", 409)
         row = get_dayoff(cur.lastrowid)
         audit("create", "dayoff", row["id"],
               f"Поставил {OFF_TYPE_LABEL[off_type].lower()} {off_date}: {employee['full_name']}, "
-              f"списать {fmt_hours(value)} ч из «{KIND_LABEL[kind]}»",
+              f"списать {fmt_hours(value)} ч из «{KIND_LABEL[kind]}»" + (f" ({reason})" if reason else ""),
               new=dayoff_snapshot(row))
-        # Списание: отрицательная запись в соответствующей таблице часов
         hcur = db().execute(
             "INSERT INTO hours (kind, work_date, employee_id, hours, comment, created_by, created_at, source, dayoff_id)"
             " VALUES (?,?,?,?,?,?,?, 'dayoff', ?)",
@@ -897,6 +990,23 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
         audit("create", f"hours_{kind}", hrow["id"],
               f"Списал за {'отсыпной' if off_type == 'sleep' else 'отгул'} из «{KIND_LABEL[kind]}»: {employee['full_name']}, {off_date}, −{fmt_hours(value)} ч",
               new=hours_snapshot(hrow))
+        return row
+
+    def remove_dayoff(row, reason=None):
+        snap = dayoff_snapshot(row)
+        drop_linked_hours("dayoff_id", row["id"], "отгул отменён, часы возвращены")
+        db().execute("DELETE FROM dayoffs WHERE id=?", (row["id"],))
+        audit("delete", "dayoff", row["id"],
+              f"Отменил {snap['Вид'].lower()} {row['off_date']}: {snap['Сотрудник']}" + (f" ({reason})" if reason else ""),
+              old=snap)
+
+    @app.post("/api/dayoffs")
+    def add_dayoff():
+        data = request.get_json(silent=True) or {}
+        off_date = parse_date(data.get("date"))
+        employee = get_employee(data.get("employee_id") if isinstance(data.get("employee_id"), int) else -1)
+        kind, value, note, off_type = dayoff_payload(data)
+        row = insert_dayoff(off_date, employee, kind, value, note, off_type)
         db().commit()
         return jsonify(dict(row)), 201
 
@@ -920,12 +1030,7 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
 
     @app.delete("/api/dayoffs/<int:dayoff_id>")
     def delete_dayoff(dayoff_id):
-        row = get_dayoff(dayoff_id)
-        snap = dayoff_snapshot(row)
-        drop_linked_hours("dayoff_id", dayoff_id, "отгул отменён, часы возвращены")
-        db().execute("DELETE FROM dayoffs WHERE id=?", (dayoff_id,))
-        audit("delete", "dayoff", dayoff_id,
-              f"Отменил {snap['Вид'].lower()} {row['off_date']}: {snap['Сотрудник']}", old=snap)
+        remove_dayoff(get_dayoff(dayoff_id))
         db().commit()
         return jsonify({"ok": True})
 
