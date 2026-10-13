@@ -89,6 +89,11 @@ function openForm(title, bodyHtml, onSubmit, submitLabel = "Сохранить")
     const data = Object.fromEntries(new FormData(form));
     if (await guarded(() => onSubmit(data))) dlg.close();
   };
+  // «Праздник» и «Предпраздник» взаимоисключающие: включение одной галочки снимает другую
+  const flags = ["holiday", "preholiday"].map((n) => form.elements[n]).filter(Boolean);
+  flags.forEach((box) => box.addEventListener("change", () => {
+    if (box.checked) flags.forEach((other) => { if (other !== box) other.checked = false; });
+  }));
   dlg.showModal();
   const first = form.querySelector("input, select");
   if (first) first.focus();
@@ -182,7 +187,8 @@ function balanceCard() {
 
 // ---------- Календарь (общий для графика дежурств и отгулов) ----------
 /** items — записи месяца; dateOf(x) — дата записи; chip(x) — HTML плашки; addLabel — подсказка кнопки «+». */
-function calendar(items, dateOf, chip, addLabel) {
+/** dayClass(itemsOfDay) — необязательные доп. классы ячейки дня (например, праздник). */
+function calendar(items, dateOf, chip, addLabel, dayClass = () => "") {
   const [y, mo] = state.month.split("-").map(Number);
   const days = new Date(y, mo, 0).getDate();
   const offset = (new Date(y, mo - 1, 1).getDay() + 6) % 7; // неделя с понедельника
@@ -193,7 +199,7 @@ function calendar(items, dateOf, chip, addLabel) {
   for (let d = 1; d <= days; d++) {
     const date = `${state.month}-${pad(d)}`;
     const dow = (offset + d - 1) % 7;
-    const cls = ["day", dow >= 5 ? "weekend" : "", date === todayStr() ? "today" : ""].join(" ");
+    const cls = ["day", dow >= 5 ? "weekend" : "", date === todayStr() ? "today" : "", dayClass(byDay[date] || [])].join(" ");
     cells += `<div class="${cls}"><div class="dnum"><span>${pad(d)}</span>
       <button class="add" data-add="${date}" title="${esc(addLabel)}" aria-label="${esc(addLabel)} на ${date}">+</button></div>
       ${(byDay[date] || []).map(chip).join("")}</div>`;
@@ -203,11 +209,13 @@ function calendar(items, dateOf, chip, addLabel) {
 
 // ---------- График дежурств ----------
 function dutyFields(x) {
-  const v = x || { kind: "official", hours: DEFAULT_DUTY_HOURS, role: "duty", note: "" };
+  const v = x || { kind: "official", hours: DEFAULT_DUTY_HOURS, role: "duty", note: "", holiday: 0, preholiday: 0 };
   return `${x ? "" : `<label><span>Дежурный</span><select name="employee_id">${employeeOptions()}</select></label>`}
     <label><span>Тип дежурства</span><select name="kind">${options(DUTY_KIND, v.kind)}</select></label>
     <label><span>Роль</span><select name="role">${options(ROLE, v.role)}</select></label>
     <label><span>Часы (по умолчанию ${DEFAULT_DUTY_HOURS})</span><input type="number" name="hours" min="0.25" max="24" step="0.25" value="${v.hours}" required></label>
+    <div class="flags"><label class="check holiday"><input type="checkbox" name="holiday" ${v.holiday ? "checked" : ""}><span>Праздник</span></label>
+      <label class="check preholiday"><input type="checkbox" name="preholiday" ${v.preholiday ? "checked" : ""}><span>Предпраздник</span></label></div>
     <label><span>Примечание (необязательно)</span><input name="note" maxlength="300" value="${esc(v.note)}" placeholder="например, ночная смена"></label>
     <p class="muted">Часы автоматически попадут в таблицу «${esc(HOURS_KIND.official)}» или «${esc(HOURS_KIND.unofficial)}» (по типу дежурства) при наступлении дня дежурства.</p>`;
 }
@@ -217,10 +225,11 @@ async function renderSchedule(seq) {
   if (isStale(seq)) return;
   const chip = (x) => {
     const title = `${x.full_name} — ${x.position}\n${DUTY_KIND[x.kind]} дежурство · ${ROLE[x.role] || x.role} · ${fmtNum(x.hours)} ч`
+      + (x.holiday ? "\nПраздничный день" : "") + (x.preholiday ? "\nПредпраздничный день" : "")
       + (x.note ? `\n${x.note}` : "") + (x.accrued_at ? "\nЧасы начислены" : "\nЧасы будут начислены в день дежурства");
     return `<div class="chip ${x.kind}" title="${esc(title)}">
       <button class="edit" data-edit-duty="${x.id}">${esc(x.full_name)}
-        <small>${x.accrued_at ? '<b class="ok">✓</b> ' : ""}${esc(ROLE_SHORT[x.role] || x.role)} · ${fmtNum(x.hours)} ч</small></button>
+        <small>${x.accrued_at ? '<b class="ok">✓</b> ' : ""}${x.holiday ? '<b class="hol">Пр.</b> ' : ""}${x.preholiday ? '<b class="hol">Предпр.</b> ' : ""}${esc(ROLE_SHORT[x.role] || x.role)} · ${fmtNum(x.hours)} ч</small></button>
       <button data-del-duty="${x.id}" title="Снять с дежурства" aria-label="Снять с дежурства">×</button></div>`;
   };
 
@@ -234,16 +243,19 @@ async function renderSchedule(seq) {
       <div class="nums"><span><em>дежурств</em><b>${c.n}</b></span><span><em>офиц. ч</em><b>${fmtNum(c.official)}</b></span>
       <span><em>неофиц. ч</em><b>${fmtNum(c.unofficial)}</b></span></div></li>`).join("");
   const legend = `<div class="legend">${badge("Официальное", "green")}${badge("Неофициальное", "amber")}
+    <span class="key-day holiday"></span><span>Праздник</span><span class="key-day preholiday"></span><span>Предпраздник</span>
     <span>Деж. — дежурный, Пом. — помощник дежурного · ✓ — часы начислены · нажмите на плашку, чтобы изменить</span></div>`;
+  const holidayClass = (list) => (list.some((d) => d.holiday) ? "holiday" : list.some((d) => d.preholiday) ? "preholiday" : "");
 
   view.innerHTML = `<div class="split">
-    ${card(monthTitle(state.month), calendar(duties, (d) => d.duty_date, chip, "Назначить дежурного") + legend,
+    ${card(monthTitle(state.month), calendar(duties, (d) => d.duty_date, chip, "Назначить дежурного", holidayClass) + legend,
       { right: badge(`${duties.length} ${plural(duties.length, ["дежурство", "дежурства", "дежурств"])}`, duties.length ? "green" : "") })}
     <aside class="rail">${card("По графику за месяц", rank ? `<ul class="kv">${rank}</ul>` : '<div class="empty">В этом месяце дежурств нет.</div>', { flush: true })}
       ${balanceCard()}</aside>
   </div>`;
 
-  const payload = (d) => ({ kind: d.kind, role: d.role, hours: Number(d.hours), note: d.note });
+  const payload = (d) => ({ kind: d.kind, role: d.role, hours: Number(d.hours), note: d.note,
+    holiday: d.holiday === "on", preholiday: d.preholiday === "on" });
   view.querySelectorAll("[data-add]").forEach((btn) => (btn.onclick = () => {
     if (!state.employees.length) return toast("Сначала добавьте дежурных на вкладке «Дежурные»");
     const date = btn.dataset.add;
@@ -585,19 +597,32 @@ function whoWhenTable(people, kind) {
     return `<tr><td>${esc(p.full_name)}<span class="sub">${esc(p.position)}${p.active ? "" : " · удалён"}</span></td>${cells}
       <td class="num total-cell"><b>${p.k.duties}</b>${meter(p.k.duties, maxTotal)}
         ${p.k.planned ? `<small class="planned">из них ${p.k.planned} впереди</small>` : ""}</td>
+      ${holidayCell(p.k.holiday, p.k.holiday_dates, "holiday")}${holidayCell(p.k.preholiday, p.k.preholiday_dates, "preholiday")}
       <td class="num">${fmtNum(p.k.hours)}</td><td class="mono">${esc(fav)}</td></tr>`;
   }).join("");
   const byDay = WEEKDAYS.map((_, i) => rows.reduce((s, p) => s + p.k.weekday[i], 0));
   const sum = byDay.reduce((a, b) => a + b, 0);
   const hours = rows.reduce((s, p) => s + p.k.hours, 0);
+  const hol = rows.reduce((s, p) => s + p.k.holiday, 0);
+  const prehol = rows.reduce((s, p) => s + p.k.preholiday, 0);
   return `<div class="table-wrap"><table class="whowhen"><thead><tr><th>Дежурный</th>
       ${WEEKDAYS.map((d, i) => `<th class="num ${i >= 5 ? "we" : ""}">${d}</th>`).join("")}
-      <th class="num">Всего</th><th class="num">Часов</th><th>Чаще всего</th></tr></thead>
+      <th class="num">Всего</th><th class="num hol" title="Дежурств в праздничные дни">Праздн.</th>
+      <th class="num hol" title="Дежурств в предпраздничные дни">Предпр.</th><th class="num">Часов</th><th>Чаще всего</th></tr></thead>
     <tbody>${body}</tbody>
     <tfoot><tr><td>Итого</td>${byDay.map((n) => `<td class="num">${n}</td>`).join("")}<td class="num">${sum}</td>
-      <td class="num">${fmtNum(hours)}</td><td></td></tr></tfoot></table></div>
+      <td class="num">${hol}</td><td class="num">${prehol}</td><td class="num">${fmtNum(hours)}</td><td></td></tr></tfoot></table></div>
     <div class="legend"><span>Чем темнее клетка, тем чаще человек дежурил в этот день недели</span>
       <span class="scale">${[1, 2, 3, 4].map((l) => `<i class="heat ${kind} h${l}"></i>`).join("")}</span></div>`;
+}
+
+/** Ячейка «сколько раз в праздник / предпраздник» со списком дат (подсказка и мелкая подпись). */
+function holidayCell(n, dates, cls) {
+  if (!n) return `<td class="num hol-cell"></td>`;
+  const fmt = (d) => d.slice(8, 10) + "." + d.slice(5, 7) + "." + d.slice(2, 4);
+  const list = dates.map(fmt);
+  const shown = list.length > 3 ? list.slice(0, 3).join(", ") + ` и ещё ${list.length - 3}` : list.join(", ");
+  return `<td class="num hol-cell ${cls}" title="${esc(list.join(", "))}"><b>${n}</b><small class="planned">${esc(shown)}</small></td>`;
 }
 
 /** Столбики Пн–Вс для одного типа дежурства. max — общий масштаб, чтобы два графика можно было сравнивать на глаз. */
@@ -686,6 +711,7 @@ async function renderAnalytics(seq) {
       ${kpi("Дежурств", t.duties, t.planned ? `из них ${t.planned} впереди` : "по графику за период")}
       ${kpi("Дежурили", t.people, plural(t.people, ["человек", "человека", "человек"]))}
       ${kpi("Часов по графику", fmtNum(t.duty_hours), "сумма часов дежурств")}
+      ${kpi("Праздники", `${t.holiday} / ${t.preholiday}`, "дежурств в праздник / предпраздник")}
       ${kpi("Официальные часы", fmtNum(accrued("official") + t.official.dayoff), `+${fmtNum(accrued("official"))} / −${fmtNum(Math.abs(t.official.dayoff))} за отгулы`)}
       ${kpi("Неофициальные часы", fmtNum(accrued("unofficial") + t.unofficial.dayoff), `+${fmtNum(accrued("unofficial"))} / −${fmtNum(Math.abs(t.unofficial.dayoff))} за отгулы`)}
     </div>

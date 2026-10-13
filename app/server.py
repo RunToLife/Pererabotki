@@ -106,6 +106,8 @@ MIGRATIONS = {
         ("hours", "REAL NOT NULL DEFAULT 24"),
         ("role", "TEXT NOT NULL DEFAULT 'duty'"),
         ("accrued_at", "TEXT"),
+        ("holiday", "INTEGER NOT NULL DEFAULT 0"),
+        ("preholiday", "INTEGER NOT NULL DEFAULT 0"),
     ],
 }
 POST_MIGRATION_SQL = """
@@ -494,7 +496,8 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
     def duty_snapshot(row):
         return {"Дата": row["duty_date"], "Сотрудник": employee_name(row["employee_id"]),
                 "Тип дежурства": DUTY_KIND_LABEL[row["kind"]], "Роль": ROLE_LABEL.get(row["role"], row["role"]),
-                "Часы": fmt_hours(row["hours"]), "Примечание": row["note"]}
+                "Часы": fmt_hours(row["hours"]), "Праздник": "да" if row["holiday"] else "нет",
+                "Предпраздник": "да" if row["preholiday"] else "нет", "Примечание": row["note"]}
 
     def dayoff_snapshot(row):
         return {"Дата": row["off_date"], "Сотрудник": employee_name(row["employee_id"]),
@@ -738,7 +741,7 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
     def list_duties():
         month = parse_month(request.args.get("month"))
         rows = db().execute(
-            "SELECT d.id, d.duty_date, d.employee_id, d.note, d.kind, d.hours, d.role, d.accrued_at,"
+            "SELECT d.id, d.duty_date, d.employee_id, d.note, d.kind, d.hours, d.role, d.accrued_at, d.holiday, d.preholiday,"
             " e.full_name, e.position"
             " FROM duties d JOIN employees e ON e.id=d.employee_id"
             " WHERE substr(d.duty_date,1,7)=? ORDER BY d.duty_date, e.full_name COLLATE NOCASE",
@@ -752,16 +755,32 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
                 parse_choice(data.get("role"), ROLE_LABEL, "Роль", "duty"),
                 clean_text(data.get("note"), "Примечание"))
 
+    def duty_flags(data):
+        """Отметки «Праздник» / «Предпраздник»: (holiday, preholiday) как 0/1. Обе сразу — ошибка."""
+        flags = []
+        for key, field in (("holiday", "Праздник"), ("preholiday", "Предпраздник")):
+            value = data.get(key, False)
+            if value in (None, ""):
+                value = False
+            if not isinstance(value, bool) and value not in (0, 1):
+                raise ApiError(f"{field}: ожидается true или false")
+            flags.append(int(bool(value)))
+        if all(flags):
+            raise ApiError("День не может быть одновременно праздником и предпраздничным")
+        return tuple(flags)
+
     @app.post("/api/duties")
     def add_duty():
         data = request.get_json(silent=True) or {}
         duty_date = parse_date(data.get("date"))
         employee = get_employee(data.get("employee_id") if isinstance(data.get("employee_id"), int) else -1)
         kind, value, role, note = duty_payload(data)
+        holiday, preholiday = duty_flags(data)
         try:
             cur = db().execute(
-                "INSERT INTO duties (duty_date, employee_id, note, kind, hours, role) VALUES (?,?,?,?,?,?)",
-                (duty_date, employee["id"], note, kind, value, role),
+                "INSERT INTO duties (duty_date, employee_id, note, kind, hours, role, holiday, preholiday)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (duty_date, employee["id"], note, kind, value, role, holiday, preholiday),
             )
         except sqlite3.IntegrityError:
             raise ApiError("Этот дежурный уже назначен на выбранную дату", 409)
@@ -782,9 +801,14 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
     @app.put("/api/duties/<int:duty_id>")
     def update_duty(duty_id):
         row = get_duty(duty_id)
-        kind, value, role, note = duty_payload(request.get_json(silent=True) or {})
+        data = request.get_json(silent=True) or {}
+        kind, value, role, note = duty_payload(data)
+        # не переданные отметки не трогаем — старые клиенты не сбросят их случайно
+        holiday, preholiday = duty_flags({"holiday": data.get("holiday", bool(row["holiday"])),
+                                          "preholiday": data.get("preholiday", bool(row["preholiday"]))})
         before = duty_snapshot(row)
-        db().execute("UPDATE duties SET kind=?, hours=?, role=?, note=? WHERE id=?", (kind, value, role, note, duty_id))
+        db().execute("UPDATE duties SET kind=?, hours=?, role=?, note=?, holiday=?, preholiday=? WHERE id=?",
+                     (kind, value, role, note, holiday, preholiday, duty_id))
         old, new = diff(before, duty_snapshot(get_duty(duty_id)))
         if new:
             audit("update", "duty", duty_id,
@@ -1023,7 +1047,7 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
 
         # strftime('%w'): 0 — воскресенье; переводим в неделю с понедельника (0 — Пн, 6 — Вс)
         duties = db().execute(
-            "SELECT d.employee_id, d.kind, d.role, d.hours, d.duty_date,"
+            "SELECT d.employee_id, d.kind, d.role, d.hours, d.duty_date, d.holiday, d.preholiday,"
             " (CAST(strftime('%w', d.duty_date) AS INTEGER) + 6) % 7 AS dow,"
             " e.full_name, e.position, e.active"
             " FROM duties d JOIN employees e ON e.id=d.employee_id WHERE " + duty_where,
@@ -1040,7 +1064,10 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
                 "duty_hours": 0.0, "official_duties": 0, "unofficial_duties": 0, "roles": {},
                 "accrued_official": 0.0, "accrued_unofficial": 0.0,
                 "deducted_official": 0.0, "deducted_unofficial": 0.0, "dayoffs": 0,
-                "by_kind": {k: {"duties": 0, "planned": 0, "weekday": [0] * 7, "hours": 0.0} for k in DUTY_KIND_LABEL},
+                "holiday": 0, "preholiday": 0, "holiday_dates": [], "preholiday_dates": [],
+                "by_kind": {k: {"duties": 0, "planned": 0, "weekday": [0] * 7, "hours": 0.0,
+                                "holiday": 0, "preholiday": 0, "holiday_dates": [], "preholiday_dates": []}
+                            for k in DUTY_KIND_LABEL},
             })
 
         for r in duties:
@@ -1056,6 +1083,11 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
             pk["planned"] += r["duty_date"] > today
             pk["weekday"][r["dow"]] += 1
             pk["hours"] += r["hours"]
+            for flag in ("holiday", "preholiday"):
+                if r[flag]:
+                    for target in (p, pk):
+                        target[flag] += 1
+                        target[f"{flag}_dates"].append(r["duty_date"])
             weekday[r["dow"]] += 1
             weekday_by_kind[r["kind"]][r["dow"]] += 1
             m = by_month.setdefault(r["duty_date"][:7], {"official": 0, "unofficial": 0, "hours": 0.0})
@@ -1093,6 +1125,9 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
         for p in persons:
             for key in ("duty_hours", "accrued_official", "accrued_unofficial", "deducted_official", "deducted_unofficial"):
                 p[key] = round(p[key], 2)
+            for target in (p, *p["by_kind"].values()):
+                target["holiday_dates"].sort()
+                target["preholiday_dates"].sort()
             for pk in p["by_kind"].values():
                 pk["hours"] = round(pk["hours"], 2)
             p["net_official"] = round(p["accrued_official"] - p["deducted_official"], 2)
@@ -1113,6 +1148,8 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
                 "planned": sum(p["planned"] for p in persons),
                 "people": sum(1 for p in persons if p["duties"]),
                 "duty_hours": round(sum(r["hours"] for r in duties), 2),
+                "holiday": sum(1 for r in duties if r["holiday"]),
+                "preholiday": sum(1 for r in duties if r["preholiday"]),
                 "official": {k: round(v, 2) for k, v in sources["official"].items()},
                 "unofficial": {k: round(v, 2) for k, v in sources["unofficial"].items()},
             },
