@@ -165,6 +165,7 @@ tfoot td { font: 800 13px var(--f-mono); border-top: var(--bd); border-bottom: 0
 dialog .flags { display: flex; flex-wrap: wrap; gap: 16px; }
 dialog label.check { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-weight: 600; }
 dialog label.check > span { color: var(--ink); font-size: 12px; }
+dialog .rule-hint { margin: 0; padding: 8px 10px; border: var(--bd); background: var(--paper); font-size: 12px; }
 dialog label.check input { padding: 0; width: 18px; height: 18px; margin: 0; accent-color: var(--red-ink); }
 th.hol { color: var(--red-ink); }
 td.hol-cell.holiday { background: #ffcfca; } td.hol-cell.preholiday { background: #ffe9e6; }
@@ -179,6 +180,8 @@ td.hol-cell small { display: block; font-weight: 400; white-space: nowrap; }
 .chip button:hover { color: var(--red-ink); }
 .chip.unofficial { background: var(--amber); }
 .chip.off { background: var(--paper); border-style: dashed; }
+.chip.off.sleep { border-style: dotted; }
+.chip .otype { font-weight: 700; }
 .chip .edit { flex: 1; min-width: 0; padding: 0; text-align: left; font: inherit; overflow: hidden; overflow-wrap: anywhere; }
 .chip .edit small { display: block; font-weight: 400; }
 .chip .edit:hover { color: inherit; text-decoration: underline; }
