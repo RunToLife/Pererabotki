@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS dayoffs (
     note        TEXT NOT NULL DEFAULT '',
     created_by  TEXT NOT NULL,
     created_at  TEXT NOT NULL,
+    off_type    TEXT NOT NULL DEFAULT 'dayoff',
     UNIQUE (off_date, employee_id)
 );
 CREATE INDEX IF NOT EXISTS idx_dayoffs_date ON dayoffs(off_date);
@@ -108,6 +109,9 @@ MIGRATIONS = {
         ("accrued_at", "TEXT"),
         ("holiday", "INTEGER NOT NULL DEFAULT 0"),
         ("preholiday", "INTEGER NOT NULL DEFAULT 0"),
+    ],
+    "dayoffs": [
+        ("off_type", "TEXT NOT NULL DEFAULT 'dayoff'"),
     ],
 }
 POST_MIGRATION_SQL = """
@@ -177,6 +181,7 @@ DUTY_KIND_LABEL = {"official": "Официальное", "unofficial": "Неоф
 ROLE_LABEL = {"duty": "Дежурный", "assistant": "Помощник дежурного", "shift": "Смена", "other": "Иное"}
 DEFAULT_DUTY_HOURS = 24
 DEFAULT_DAYOFF_HOURS = 8
+OFF_TYPE_LABEL = {"dayoff": "Отгул", "sleep": "Отсыпной"}
 SYSTEM_ACTOR = "система"
 ENTITY_LABEL = {
     "employee": "Список дежурных",
@@ -225,14 +230,17 @@ def fmt_hours(value):
     return f"{value:g}"
 
 
-def parse_hours(value, field="Часы"):
+def parse_hours(value, field="Часы", allow_zero=False):
+    """Часы больше 0 и не более 24; с allow_zero (дежурства и отгулы) допустим и 0 — «без часов»."""
     try:
         number = float(value)
     except (TypeError, ValueError):
         raise ApiError(f"{field}: ожидается число")
-    if not 0 < number <= 24:
+    if allow_zero and not 0 <= number <= 24:
+        raise ApiError(f"{field}: допустимо значение от 0 до 24")
+    if not allow_zero and not 0 < number <= 24:
         raise ApiError(f"{field}: допустимо значение больше 0 и не более 24")
-    return round(number, 2)
+    return round(number, 2) + 0.0  # + 0.0 убирает «−0»
 
 
 def parse_choice(value, choices, field, default):
@@ -501,6 +509,7 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
 
     def dayoff_snapshot(row):
         return {"Дата": row["off_date"], "Сотрудник": employee_name(row["employee_id"]),
+                "Вид": OFF_TYPE_LABEL[row["off_type"]],
                 "Списать из": KIND_LABEL[row["kind"]], "Часы": fmt_hours(row["hours"]), "Примечание": row["note"]}
 
     def hours_snapshot(row):
@@ -751,7 +760,7 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
 
     def duty_payload(data):
         return (parse_choice(data.get("kind"), DUTY_KIND_LABEL, "Тип дежурства", "official"),
-                parse_hours(DEFAULT_DUTY_HOURS if data.get("hours") in (None, "") else data.get("hours")),
+                parse_hours(DEFAULT_DUTY_HOURS if data.get("hours") in (None, "") else data.get("hours"), allow_zero=True),
                 parse_choice(data.get("role"), ROLE_LABEL, "Роль", "duty"),
                 clean_text(data.get("note"), "Примечание"))
 
@@ -834,20 +843,22 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
     def list_dayoffs():
         month = parse_month(request.args.get("month"))
         rows = db().execute(
-            "SELECT o.id, o.off_date, o.employee_id, o.kind, o.hours, o.note, o.created_by,"
+            "SELECT o.id, o.off_date, o.employee_id, o.kind, o.hours, o.note, o.off_type, o.created_by,"
             " e.full_name, e.position FROM dayoffs o JOIN employees e ON e.id=o.employee_id"
             " WHERE substr(o.off_date,1,7)=? ORDER BY o.off_date, e.full_name COLLATE NOCASE",
             (month,),
         ).fetchall()
         return jsonify([dict(r) for r in rows])
 
-    def dayoff_payload(data):
+    def dayoff_payload(data, default_type="dayoff"):
         return (parse_choice(data.get("kind"), KIND_LABEL, "Тип часов", "official"),
-                parse_hours(DEFAULT_DAYOFF_HOURS if data.get("hours") in (None, "") else data.get("hours")),
-                clean_text(data.get("note"), "Примечание"))
+                parse_hours(DEFAULT_DAYOFF_HOURS if data.get("hours") in (None, "") else data.get("hours"),
+                            allow_zero=True),
+                clean_text(data.get("note"), "Примечание"),
+                parse_choice(data.get("off_type"), OFF_TYPE_LABEL, "Вид", default_type))
 
-    def dayoff_comment(value, note):
-        return f"Отгул · списано {fmt_hours(value)} ч" + (f" · {note}" if note else "")
+    def dayoff_comment(off_type, value, note):
+        return f"{OFF_TYPE_LABEL[off_type]} · списано {fmt_hours(value)} ч" + (f" · {note}" if note else "")
 
     def get_dayoff(dayoff_id):
         row = db().execute("SELECT * FROM dayoffs WHERE id=?", (dayoff_id,)).fetchone()
@@ -860,29 +871,31 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
         data = request.get_json(silent=True) or {}
         off_date = parse_date(data.get("date"))
         employee = get_employee(data.get("employee_id") if isinstance(data.get("employee_id"), int) else -1)
-        kind, value, note = dayoff_payload(data)
+        kind, value, note, off_type = dayoff_payload(data)
         ts = now_str()
         try:
             cur = db().execute(
-                "INSERT INTO dayoffs (off_date, employee_id, kind, hours, note, created_by, created_at)"
-                " VALUES (?,?,?,?,?,?,?)",
-                (off_date, employee["id"], kind, value, note, g.actor, ts),
+                "INSERT INTO dayoffs (off_date, employee_id, kind, hours, note, off_type, created_by, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (off_date, employee["id"], kind, value, note, off_type, g.actor, ts),
             )
         except sqlite3.IntegrityError:
-            raise ApiError("У этого сотрудника уже есть отгул на выбранную дату", 409)
+            raise ApiError("У этого сотрудника уже есть отгул или отсыпной на выбранную дату", 409)
         row = get_dayoff(cur.lastrowid)
         audit("create", "dayoff", row["id"],
-              f"Поставил отгул {off_date}: {employee['full_name']}, списать {fmt_hours(value)} ч из «{KIND_LABEL[kind]}»",
+              f"Поставил {OFF_TYPE_LABEL[off_type].lower()} {off_date}: {employee['full_name']}, "
+              f"списать {fmt_hours(value)} ч из «{KIND_LABEL[kind]}»",
               new=dayoff_snapshot(row))
         # Списание: отрицательная запись в соответствующей таблице часов
         hcur = db().execute(
             "INSERT INTO hours (kind, work_date, employee_id, hours, comment, created_by, created_at, source, dayoff_id)"
             " VALUES (?,?,?,?,?,?,?, 'dayoff', ?)",
-            (kind, off_date, employee["id"], -value, dayoff_comment(value, note), g.actor, ts, row["id"]),
+            (kind, off_date, employee["id"], -value + 0.0, dayoff_comment(off_type, value, note), g.actor, ts,
+             row["id"]),
         )
         hrow = db().execute("SELECT * FROM hours WHERE id=?", (hcur.lastrowid,)).fetchone()
         audit("create", f"hours_{kind}", hrow["id"],
-              f"Списал за отгул из «{KIND_LABEL[kind]}»: {employee['full_name']}, {off_date}, −{fmt_hours(value)} ч",
+              f"Списал за {'отсыпной' if off_type == 'sleep' else 'отгул'} из «{KIND_LABEL[kind]}»: {employee['full_name']}, {off_date}, −{fmt_hours(value)} ч",
               new=hours_snapshot(hrow))
         db().commit()
         return jsonify(dict(row)), 201
@@ -890,14 +903,18 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
     @app.put("/api/dayoffs/<int:dayoff_id>")
     def update_dayoff(dayoff_id):
         row = get_dayoff(dayoff_id)
-        kind, value, note = dayoff_payload(request.get_json(silent=True) or {})
+        # не переданный вид не трогаем — старые клиенты не сбросят отсыпной в отгул
+        kind, value, note, off_type = dayoff_payload(request.get_json(silent=True) or {}, row["off_type"])
         before = dayoff_snapshot(row)
-        db().execute("UPDATE dayoffs SET kind=?, hours=?, note=? WHERE id=?", (kind, value, note, dayoff_id))
+        db().execute("UPDATE dayoffs SET kind=?, hours=?, note=?, off_type=? WHERE id=?",
+                     (kind, value, note, off_type, dayoff_id))
         old, new = diff(before, dayoff_snapshot(get_dayoff(dayoff_id)))
         if new:
             audit("update", "dayoff", dayoff_id,
-                  f"Изменил отгул {row['off_date']} ({before['Сотрудник']}): {changes_text(old, new)}", old, new)
-            sync_linked_hours("dayoff_id", dayoff_id, kind, -value, dayoff_comment(value, note), "отгул изменён")
+                  f"Изменил {OFF_TYPE_LABEL[row['off_type']].lower()} {row['off_date']} ({before['Сотрудник']}): "
+                  f"{changes_text(old, new)}", old, new)
+            sync_linked_hours("dayoff_id", dayoff_id, kind, -value + 0.0, dayoff_comment(off_type, value, note),
+                              "отгул изменён")
             db().commit()
         return jsonify(dict(get_dayoff(dayoff_id)))
 
@@ -907,7 +924,8 @@ def create_app(db_path=None, auth_mode=None, authenticator=None):
         snap = dayoff_snapshot(row)
         drop_linked_hours("dayoff_id", dayoff_id, "отгул отменён, часы возвращены")
         db().execute("DELETE FROM dayoffs WHERE id=?", (dayoff_id,))
-        audit("delete", "dayoff", dayoff_id, f"Отменил отгул {row['off_date']}: {snap['Сотрудник']}", old=snap)
+        audit("delete", "dayoff", dayoff_id,
+              f"Отменил {snap['Вид'].lower()} {row['off_date']}: {snap['Сотрудник']}", old=snap)
         db().commit()
         return jsonify({"ok": True})
 

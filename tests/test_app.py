@@ -179,11 +179,21 @@ class AppTest(unittest.TestCase):
         future = (date.today() + timedelta(days=3)).isoformat()
         d = self.c.post("/api/duties", json={"date": future, "employee_id": eid}).get_json()
         self.assertEqual((d["kind"], d["hours"], d["role"], d["accrued_at"]), ("official", 24, "duty", None))
-        for bad in ({"kind": "x"}, {"role": "boss"}, {"hours": 0}, {"hours": 30}):
+        for bad in ({"kind": "x"}, {"role": "boss"}, {"hours": -1}, {"hours": 30}):
             body = {"date": (date.today() + timedelta(days=4)).isoformat(), "employee_id": eid, **bad}
             self.assertEqual(self.c.post("/api/duties", json=body).status_code, 400, bad)
         # будущее дежурство ещё не начислено
         self.assertEqual(self.hours("official", future[:7]), [])
+
+    def test_duty_allows_zero_hours(self):
+        eid = self.emp()
+        past = (date.today() - timedelta(days=1)).isoformat()
+        r = self.c.post("/api/duties", json={"date": past, "employee_id": eid, "hours": 0})
+        self.assertEqual(r.status_code, 201, r.get_json())
+        self.assertEqual(r.get_json()["hours"], 0)
+        self.assertEqual([x["hours"] for x in self.hours("official", past[:7])], [0])
+        self.assertEqual(self.c.put(f"/api/duties/{r.get_json()['id']}", json={"hours": 6}).status_code, 200)
+        self.assertEqual([x["hours"] for x in self.hours("official", past[:7])], [6])
 
     def test_duty_accrues_on_its_day_once(self):
         eid = self.emp()
@@ -269,9 +279,31 @@ class AppTest(unittest.TestCase):
 
     def test_dayoff_validation(self):
         eid = self.emp()
-        for bad in ({"kind": "x"}, {"hours": 0}, {"hours": 25}, {"date": "bad"}, {"employee_id": 999}):
+        for bad in ({"kind": "x"}, {"hours": -1}, {"hours": 25}, {"date": "bad"}, {"employee_id": 999},
+                    {"off_type": "x"}):
             body = {"date": "2026-09-10", "employee_id": eid, **bad}
             self.assertIn(self.c.post("/api/dayoffs", json=body).status_code, (400, 404), bad)
+
+    def test_dayoff_or_sleep_day_with_zero_hours(self):
+        eid = self.emp()
+        r = self.c.post("/api/dayoffs", json={"date": "2026-09-11", "employee_id": eid, "off_type": "sleep", "hours": 0})
+        self.assertEqual(r.status_code, 201, r.get_json())
+        off = r.get_json()
+        self.assertEqual((off["off_type"], off["hours"]), ("sleep", 0))
+        rows = self.hours("official", "2026-09")
+        self.assertEqual([x["hours"] for x in rows], [0])
+        self.assertIn("Отсыпной", rows[0]["comment"])
+        self.assertIn("Поставил отсыпной", self.audit(entity="dayoff")["items"][0]["summary"])
+        # без off_type при изменении вид сохраняется, с ним — меняется
+        self.c.put(f"/api/dayoffs/{off['id']}", json={"hours": 4})
+        got = self.c.get("/api/dayoffs?month=2026-09").get_json()[0]
+        self.assertEqual((got["off_type"], got["hours"]), ("sleep", 4))
+        self.c.put(f"/api/dayoffs/{off['id']}", json={"hours": 4, "off_type": "dayoff"})
+        self.assertEqual(self.c.get("/api/dayoffs?month=2026-09").get_json()[0]["off_type"], "dayoff")
+        self.assertIn("Отгул", self.hours("official", "2026-09")[0]["comment"])
+        # по умолчанию — отгул
+        d2 = self.c.post("/api/dayoffs", json={"date": "2026-09-12", "employee_id": eid}).get_json()
+        self.assertEqual(d2["off_type"], "dayoff")
 
     def test_migrates_old_database(self):
         db_path = os.path.join(self.tmp.name, "old.db")
